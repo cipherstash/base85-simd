@@ -1,0 +1,12 @@
+[package]
+name = "base85-simd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+paste = "1.0.15"
+quickcheck = "1.0.3"
+itertools = "0.14.0"
+vitaminc = { version = "0.1.0-pre2", features = ["random"] }

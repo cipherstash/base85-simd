@@ -1,4 +1,6 @@
-use std::{arch::aarch64::{uint32x2_t, uint32x4_t, uint64x2_t, vcombine_u32, vdupq_n_u32, vmull_u32, vmulq_u32, vshrn_n_u32, vshrn_n_u64, vshrq_n_u32, vsubq_u32}, mem::transmute};
+use std::{arch::aarch64::{uint32x2_t, uint32x4_t, uint64x2_t, uint8x16_t, vaesmcq_u8, vandq_u32, vcombine_u32, vdupq_n_u32, vextq_u32, vget_low_u32, vld1_u32, vld1q_dup_u32, vld1q_s32, vld1q_u32, vld1q_u8, vmull_high_n_u32, vmull_n_u32, vmull_u32, vmulq_u32, vorrq_u8, vreinterpretq_u32_u64, vreinterpretq_u64_u32, vreinterpretq_u8_u32, vshlq_u32, vshrn_n_u32, vshrn_n_u64, vshrq_n_u32, vsubq_u32, vtrn1q_u32, vtrn2q_u32, vzip1q_u32, vzip2q_u32, vzipq_u32}, mem::transmute};
+
+use vitaminc::random::{Generatable, SafeRand, SeedableRng};
 
 const MAGIC: u64 = 13889313184910721217; // Magic multiplier for 85
 const MAGIC_U32: u32 = 3233857729; // Magic multiplier for 85
@@ -177,24 +179,89 @@ fn main() {
     // out[3] = in % (85^2) / 85
     // out[4] = in % 85
 
-    // Create the multiplier SIMD vector
-    /*let magic_4: uint32x2_t = unsafe { std::arch::aarch64::vdup_n_u32(MAGIC_U32_4) };
+    let mut rand = SafeRand::from_entropy();
+    let input: [u8; 16] = Generatable::random(&mut rand).unwrap();
+    
+    /*let mask1 = [0, 0xFF, 0xFF, 0xFF];
+    let mask2 = [0xFF, 0, 0, 0];
+    let input1: [u32; 4] = [1, 2, 3, 4];
+    let input2: [u32; 4] = [5, 6, 7, 8];
+    let input3: [u32; 4] = [9, 10, 11, 12];
+    let input4: [u32; 4] = [13, 14, 15, 16];
+    let input5: [u32; 4] = [17, 18, 19, 20];
 
-    let mut rng = SafeRand::from_entropy();
-    let input: [u8; 16] = Generatable::random(&mut rng).unwrap();
+    let input1: uint32x4_t = unsafe { vld1q_u32(input1.as_ptr() as *const u32) };
+    let mask1: uint32x4_t = unsafe { vld1q_u32(mask1.as_ptr() as *const u32) };
+    let mask2: uint32x4_t = unsafe { vld1q_u32(mask2.as_ptr() as *const u32) };
 
-    naive(input);
+    println!("input1: {:?}", input1);
 
-    let low_input: uint32x2_t = unsafe { std::arch::aarch64::vld1_u32(input[0..8].as_ptr() as *const u32) };
-    let high_input: uint32x2_t = unsafe { std::arch::aarch64::vld1_u32(input[8..16].as_ptr() as *const u32) };
+    let rotated = unsafe { vextq_u32(input1, input1, 3) };
+    println!("rotated: {:?}", rotated);
+    let out1 = unsafe { vandq_u32(rotated, mask1) };
+    println!("out1: {:?}", out1);
+    let out2 = unsafe { vandq_u32(rotated, mask2) };
+    println!("out2: {:?}", out2);*/
+    /*let input2: uint32x4_t = unsafe { vld1q_u32(input2.as_ptr() as *const u32) };
+    let input3: uint32x4_t = unsafe { vld1q_u32(input3.as_ptr() as *const u32) };
+    let input4: uint32x4_t = unsafe { vld1q_u32(input4.as_ptr() as *const u32) };
+    let input5: uint32x4_t = unsafe { vld1q_u32(input5.as_ptr() as *const u32) };
 
-    // This is output values 0, 5, 10, 15 (of 20 bytes total)
-    let combined: uint32x4_t = divide_simd::<SHIFT_4>(low_input, high_input, magic_4);
+    let shift_values: [i32; 4] = [24, 16, 8, 0];
 
-    dbg!(combined);*/
+    let mut out = unsafe {
+        let shifts = vld1q_s32(shift_values.as_ptr() as *const i32);
+        vreinterpretq_u8_u32(vshlq_u32(input1, shifts))
+    };
 
-    println!("{:?}", fast_path(85));
-    println!("{:?}", fast_path(85 * 85));
-    println!("{:?}", fast_path(85 * 85 * 85));
-    println!("{:?}", fast_path(85 * 85 * 85 * 85));
+    //println!("shifted: {:?}", out);
+
+    let shift_values: [i32; 4] = [16, 8, 0, -8];
+
+    println!("input2: {:?}", input2);
+
+    out = unsafe {
+        let shifts = vld1q_s32(shift_values.as_ptr() as *const i32);
+        vorrq_u8(vreinterpretq_u8_u32(vshlq_u32(input2, shifts)), out)
+    };*/
+    //println!("shifted: {:?}", out);
+
+    /*let shift_values: [i32; 4] = [16, 24, 32, 32];
+    out = unsafe {
+        let shifts = vld1q_s32(shift_values.as_ptr() as *const i32);
+        vorrq_u8(vreinterpretq_u8_u32(vshlq_u32(input3, shifts)), out)
+    };
+    println!("shifted: {:?}", out);
+
+    let shift_values: [i32; 4] = [24, 32, 32, 32];
+    out = unsafe {
+        let shifts = vld1q_s32(shift_values.as_ptr() as *const i32);
+        vorrq_u8(vreinterpretq_u8_u32(vshlq_u32(input4, shifts)), out)
+    };
+    println!("shifted: {:?}", out);
+
+    let shift_values: [i32; 4] = [24, 32, 32, 32];
+    out = unsafe {
+        let shifts = vld1q_s32(shift_values.as_ptr() as *const i32);
+        vorrq_u8(vreinterpretq_u8_u32(vshlq_u32(input4, shifts)), out)
+    };*/
+
+    //println!("out: {:?}", out);
+
+    
+    /*let mult_h = unsafe { vmull_high_n_u32(input, 10) };
+    let mult_l = unsafe { vmull_n_u32(vget_low_u32(input), 10) };
+
+
+    let mult_h_u32 = unsafe { vreinterpretq_u32_u64(mult_h) };
+    let mult_l_u32 = unsafe { vreinterpretq_u32_u64(mult_l) };
+
+    let out3 = unsafe { vtrn1q_u32(mult_h_u32, mult_l_u32) };
+    println!("out3: {:?}", out3);*/
+
+    //let input: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    let out = base85_simd::encode_slice(&input);
+    println!("Encoded: {:?}", out);
+
+
 }

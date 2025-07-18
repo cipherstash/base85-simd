@@ -6,6 +6,7 @@ mod ops;
 pub use block::Block;
 use crate::block::BlockNeon;
 
+#[inline(never)]
 pub fn encode_slice(input: &[u8]) -> String {
     let out_len = input.len().div_ceil(4) * 5;
     let mut out = Vec::<u8>::with_capacity(out_len);
@@ -36,7 +37,7 @@ pub fn encode_slice_neon(input: &[u8]) -> String {
         out.set_len(out_len);
     }
 
-    let out_chunks = out.chunks_exact_mut(5);
+    let out_chunks = out.chunks_exact_mut(20);
     let encoder = BlockNeon::new();
     for (chunk, out) in input.chunks(16).zip(out_chunks) {
         encoder.encode_into(chunk, out);

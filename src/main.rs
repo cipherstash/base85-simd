@@ -30,8 +30,8 @@ fn main() {
     //let input: [u8; 16] = Generatable::random(&mut rand).unwrap();
     let input: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
     println!("Input: {:?}", input);
-    base85_simd::encode_slice(&input);
-    base85_simd::encode_slice_neon(&input);
+    println!("{}", base85_simd::encode_slice(&input));
+    println!("{}", base85_simd::encode_slice_neon(&input));
 
     /*let index_1_base: [u8; 16] = [0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF, 0xFF, 12];
 

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bytes = "1.10.1"
+bytes = "1.11.1"
 vitaminc = { version = "0.1.0-pre2", features = ["random"] }
 
 [dev-dependencies]

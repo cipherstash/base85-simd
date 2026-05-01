@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Build + test on both architectures the crate cares about: aarch64
+  # (where the NEON path is exercised) and x86_64 (where the scalar
+  # fallback is exercised). Both stable and the declared MSRV.
+  test:
+    name: test / ${{ matrix.os }} / ${{ matrix.rust }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest      # Apple Silicon → aarch64
+          - ubuntu-latest     # x86_64
+        rust:
+          - stable
+          - "1.85"            # MSRV (must match `rust-version` in Cargo.toml)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (debug)
+        run: cargo build --all-targets --locked
+
+      - name: Test (debug)
+        run: cargo test --locked
+
+      - name: Test (release)
+        run: cargo test --release --locked
+
+  # Strict clippy: the crate's lib.rs denies a set of "no panic in
+  # production" lints; CI enforces no warnings on top of that. Run on
+  # both architectures so target-cfg gates are exercised.
+  clippy:
+    name: clippy / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # Verify the crate cross-compiles to architectures we don't natively
+  # test on. aarch64-unknown-linux-gnu exercises the NEON path under a
+  # different OS; we only `cargo check` to keep CI fast (no QEMU runner).
+  cross-check:
+    name: cross-check / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Cargo check
+        run: cargo check --target ${{ matrix.target }} --all-targets --locked
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build docs (deny broken intra-doc links)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked

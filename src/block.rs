@@ -166,10 +166,10 @@ mod neon {
 
     use crate::ops::{div_85, div_85_cube, div_85_sq};
     use std::arch::aarch64::{
-        uint8x16_t, uint8x16x2_t, uint32x4_t, vandq_u8, vbslq_u8, vceqq_u8, vcgtq_u8, vcltq_u32,
-        vcltq_u8, vdupq_n_u8, vld1q_u8, vld1q_u8_x2, vld1q_u8_x4, vmaxvq_u32, vmaxvq_u8,
+        uint8x16_t, uint8x16x2_t, uint32x4_t, vandq_u8, vbslq_u8, vceqq_u8, vcgtq_u8, vcltq_u8,
+        vcltq_u32, vdupq_n_u8, vld1q_u8, vld1q_u8_x2, vld1q_u8_x4, vmaxvq_u8, vmaxvq_u32,
         vmlaq_n_u32, vmlsq_n_u32, vmulq_n_u32, vorrq_u8, vqtbl2q_u8, vqtbl4q_u8, vqtbx1q_u8,
-        vreinterpretq_u32_u8, vreinterpretq_u8_u32, vrev32q_u8, vst1q_u8, vsubq_u8,
+        vreinterpretq_u8_u32, vreinterpretq_u32_u8, vrev32q_u8, vst1q_u8, vsubq_u8,
     };
 
     // Per-digit splice indexes, computed at compile time and loaded
@@ -179,22 +179,44 @@ mod neon {
     // hence the source offsets `4*i`.
     static IDX_OUT_1: [[u8; 16]; 5] = [
         // k=0: out_1[0,5,10,15] ← src bytes 0,4,8,12
-        [0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF, 0xFF, 12],
+        [
+            0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF, 0xFF, 12,
+        ],
         // k=1: out_1[1,6,11] ← 0,4,8 (block 3 → out_2)
-        [0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF, 0xFF],
+        [
+            0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF, 0xFF,
+        ],
         // k=2: out_1[2,7,12] ← 0,4,8
-        [0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF],
+        [
+            0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF,
+        ],
         // k=3: out_1[3,8,13] ← 0,4,8
-        [0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF],
+        [
+            0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF,
+        ],
         // k=4: out_1[4,9,14] ← 0,4,8
-        [0xFF, 0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF],
+        [
+            0xFF, 0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF,
+        ],
     ];
     // Indexes for digits 1..4 spilling into out_2 (block 3, src byte 12).
     static IDX_OUT_2: [[u8; 16]; 4] = [
-        [12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-        [0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-        [0xFF, 0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-        [0xFF, 0xFF, 0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        [
+            12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF,
+        ],
+        [
+            0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF,
+        ],
+        [
+            0xFF, 0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF,
+        ],
+        [
+            0xFF, 0xFF, 0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF,
+        ],
     ];
 
     /// Encodes 16 input bytes into 20 output characters using NEON.
@@ -286,11 +308,7 @@ mod neon {
                 vst1q_u8(out_bytes.as_mut_ptr(), out_1);
                 let mut tail_buf = [0u8; 16];
                 vst1q_u8(tail_buf.as_mut_ptr(), out_2);
-                std::ptr::copy_nonoverlapping(
-                    tail_buf.as_ptr(),
-                    out_bytes.as_mut_ptr().add(16),
-                    4,
-                );
+                std::ptr::copy_nonoverlapping(tail_buf.as_ptr(), out_bytes.as_mut_ptr().add(16), 4);
             }
         }
     }
@@ -323,9 +341,8 @@ mod neon {
 
         // Mask: 0xFF for the 4 real-input lanes of `chars_tail`, 0 for the
         // 12 padding lanes — used to suppress validation noise from padding.
-        static TAIL_VALID_MASK: [u8; 16] = [
-            0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        static TAIL_VALID_MASK: [u8; 16] =
+            [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let tail_valid_mask = unsafe { vld1q_u8(TAIL_VALID_MASK.as_ptr()) };
 
         // Char range validation: any byte not in [33, 126] is invalid.
@@ -396,21 +413,11 @@ mod neon {
         static IDX_D3: [u8; 16] = idx(3);
         static IDX_D4: [u8; 16] = idx(4);
 
-        let v_d0 = unsafe {
-            vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D0.as_ptr())))
-        };
-        let v_d1 = unsafe {
-            vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D1.as_ptr())))
-        };
-        let v_d2 = unsafe {
-            vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D2.as_ptr())))
-        };
-        let v_d3 = unsafe {
-            vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D3.as_ptr())))
-        };
-        let v_d4 = unsafe {
-            vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D4.as_ptr())))
-        };
+        let v_d0 = unsafe { vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D0.as_ptr()))) };
+        let v_d1 = unsafe { vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D1.as_ptr()))) };
+        let v_d2 = unsafe { vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D2.as_ptr()))) };
+        let v_d3 = unsafe { vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D3.as_ptr()))) };
+        let v_d4 = unsafe { vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D4.as_ptr()))) };
 
         // Horner: n = ((((d0 * 85 + d1) * 85 + d2) * 85 + d3) * 85 + d4).
         // Each `vmlaq_n_u32(acc, v, k)` is `acc + v * k` lane-wise. The
@@ -453,14 +460,14 @@ mod neon {
         // Two tables covering ASCII [33, 96] and [97, 128]. Gaps in the
         // alphabet are filled with 0xFF.
         static CHAR_TO_85: [u8; 64] = [
-            62, 0xFF, 63, 64, 65, 66, 0xFF, 67, 68, 69, 70, 0xFF, 71, 0xFF, 0xFF, 0, 1, 2, 3, 4,
-            5, 6, 7, 8, 9, 0xFF, 72, 73, 74, 75, 76, 77, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-            20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 0xFF, 0xFF, 0xFF,
-            78, 79, 80,
+            62, 0xFF, 63, 64, 65, 66, 0xFF, 67, 68, 69, 70, 0xFF, 71, 0xFF, 0xFF, 0, 1, 2, 3, 4, 5,
+            6, 7, 8, 9, 0xFF, 72, 73, 74, 75, 76, 77, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+            21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 0xFF, 0xFF, 0xFF, 78, 79,
+            80,
         ];
         static CHAR_TO_85_X2: [u8; 32] = [
-            36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
-            57, 58, 59, 60, 61, 81, 82, 83, 84, 0xFF, 0xFF,
+            36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
+            58, 59, 60, 61, 81, 82, 83, 84, 0xFF, 0xFF,
         ];
 
         let t1 = unsafe { vld1q_u8_x4(CHAR_TO_85.as_ptr()) };
@@ -505,7 +512,6 @@ mod neon {
             vreinterpretq_u32_u8(swapped)
         }
     }
-
 }
 
 #[cfg(test)]
@@ -543,7 +549,10 @@ mod tests {
     #[test]
     fn decode_tail_round_trip() {
         for n in 1..=3usize {
-            let input: Vec<u8> = (0u8..=255).step_by(if n == 0 { 1 } else { 256 / n + 1 }).take(n).collect();
+            let input: Vec<u8> = (0u8..=255)
+                .step_by(if n == 0 { 1 } else { 256 / n + 1 })
+                .take(n)
+                .collect();
             let encoded = base85::encode(&input);
             let mut out = vec![0u8; n];
             decode_tail(encoded.as_bytes(), &mut out, 0).expect("valid encoding");

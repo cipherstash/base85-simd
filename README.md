@@ -52,7 +52,7 @@ Sample results (Apple M-series, 1 KB input):
 
 | Operation | `base85` | `base85-simd` | speedup |
 |-----------|----------|---------------|---------|
-| encode    | 361 ns   | 236 ns        | 1.5×    |
+| encode    | 361 ns   | 221 ns        | 1.6×    |
 | decode    | 2.33 µs  | 230 ns        | 10×     |
 
 ## License

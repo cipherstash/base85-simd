@@ -137,51 +137,53 @@ pub(crate) use neon::{NeonEncoder, try_decode_block_x4};
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use crate::ops::quotients_and_remainders;
+    use crate::ops::{div_85, div_85_cube, div_85_sq};
     use std::arch::aarch64::{
-        uint8x16_t, uint8x16x2_t, uint32x4_t, uint32x4x2_t, vandq_u8, vbslq_u8, vceqq_u8,
-        vcgtq_u8, vcltq_u32, vcltq_u8, vdupq_n_u8, vextq_u8, vld1q_u32, vld1q_u8, vld1q_u8_x2,
-        vld1q_u8_x4, vmaxvq_u32, vmaxvq_u8, vmlaq_n_u32, vmulq_n_u32, vorrq_u8, vqtbl2q_u8,
-        vqtbl4q_u8, vqtbx1q_u8, vreinterpretq_u32_u8, vreinterpretq_u8_u32, vrev32q_u8,
-        vst1q_lane_u32, vst1q_u8, vsubq_u8,
+        uint8x16_t, uint8x16x2_t, uint32x4_t, vandq_u8, vbslq_u8, vceqq_u8, vcgtq_u8, vcltq_u32,
+        vcltq_u8, vdupq_n_u8, vld1q_u32, vld1q_u8, vld1q_u8_x2, vld1q_u8_x4, vmaxvq_u32,
+        vmaxvq_u8, vmlaq_n_u32, vmlsq_n_u32, vmulq_n_u32, vorrq_u8, vqtbl2q_u8, vqtbl4q_u8,
+        vqtbx1q_u8, vreinterpretq_u32_u8, vreinterpretq_u8_u32, vrev32q_u8, vst1q_lane_u32,
+        vst1q_u8, vsubq_u8,
     };
+
+    // Per-digit splice indexes, computed at compile time and loaded
+    // from .rodata each call. Output position of digit k of block i is
+    // `5*i + k`; positions ≥ 16 spill into out_2 (with offset −16).
+    // Each v_dk is a u32x4 with the digit in byte 0/4/8/12 of its lane,
+    // hence the source offsets `4*i`.
+    static IDX_OUT_1: [[u8; 16]; 5] = [
+        // k=0: out_1[0,5,10,15] ← src bytes 0,4,8,12
+        [0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF, 0xFF, 12],
+        // k=1: out_1[1,6,11] ← 0,4,8 (block 3 → out_2)
+        [0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF, 0xFF],
+        // k=2: out_1[2,7,12] ← 0,4,8
+        [0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF],
+        // k=3: out_1[3,8,13] ← 0,4,8
+        [0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF],
+        // k=4: out_1[4,9,14] ← 0,4,8
+        [0xFF, 0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF],
+    ];
+    // Indexes for digits 1..4 spilling into out_2 (block 3, src byte 12).
+    static IDX_OUT_2: [[u8; 16]; 4] = [
+        [12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        [0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        [0xFF, 0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        [0xFF, 0xFF, 0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+    ];
 
     /// Encodes 16 input bytes into 20 output characters using NEON.
     ///
-    /// Pre-computes table-lookup index vectors once at construction so
-    /// the per-block work is just four `divmod 85` SIMD steps and two
-    /// table merges.
-    pub(crate) struct NeonEncoder {
-        indexes_1: [uint8x16_t; 5],
-        indexes_2: [uint8x16_t; 4],
-    }
+    /// Computes all four quotients (`n/85, n/85², n/85³, n/85⁴`) in
+    /// parallel from `n` rather than chaining four `÷ 85` steps in
+    /// series. Three are direct (independent), and `q4 = q2 / 85²`
+    /// composes the `/85²` magic twice because the direct `/85⁴` magic
+    /// doesn't satisfy libdivide's precision bound for u32 inputs.
+    pub(crate) struct NeonEncoder;
 
     impl NeonEncoder {
+        #[inline]
         pub(crate) fn new() -> Self {
-            // Index pattern: each output 5-char block writes 4 chars into
-            // out_1 (the main 16-byte vector) and 1 char into out_2 (the
-            // overflow 4-byte vector). The offsets-of-4 within out_1 are
-            // computed by `vextq_u8`-rotating a base index vector.
-            let index_1_base: [u8; 16] = [
-                0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF, 0xFF, 12,
-            ];
-            let index_1_base: uint8x16_t = unsafe { vld1q_u8(index_1_base.as_ptr()) };
-            let blanks: uint8x16_t = unsafe { vdupq_n_u8(0xFF) };
-
-            let index_4_1 = unsafe { vextq_u8(blanks, index_1_base, 12) };
-            let index_3_1 = unsafe { vextq_u8(blanks, index_1_base, 13) };
-            let index_2_1 = unsafe { vextq_u8(blanks, index_1_base, 14) };
-            let index_1_1 = unsafe { vextq_u8(blanks, index_1_base, 15) };
-
-            let index_4_2 = unsafe { vextq_u8(index_1_base, blanks, 12) };
-            let index_3_2 = unsafe { vextq_u8(index_4_2, index_4_2, 1) };
-            let index_2_2 = unsafe { vextq_u8(index_3_2, index_3_2, 1) };
-            let index_1_2 = unsafe { vextq_u8(index_2_2, index_2_2, 1) };
-
-            Self {
-                indexes_1: [index_4_1, index_3_1, index_2_1, index_1_1, index_1_base],
-                indexes_2: [index_4_2, index_3_2, index_2_2, index_1_2],
-            }
+            Self
         }
 
         /// Encode exactly 16 input bytes into exactly 20 output bytes.
@@ -194,22 +196,62 @@ mod neon {
             debug_assert!(in_bytes.len() >= 16);
             debug_assert!(out_bytes.len() >= 20);
 
-            let mut input = unsafe { load_u32x4_be(in_bytes) };
-            let mut out_1: uint8x16_t = unsafe { vdupq_n_u8(0) };
-            let mut out_2: uint8x16_t = unsafe { vdupq_n_u8(0) };
+            let n = unsafe { load_u32x4_be(in_bytes) };
 
-            for i in 0..4 {
-                let uint32x4x2_t(quotients, rem) = quotients_and_remainders(input);
-                let rem = unsafe { vreinterpretq_u8_u32(rem) };
-                out_1 = unsafe { vqtbx1q_u8(out_1, rem, self.indexes_1[i]) };
-                out_2 = unsafe { vqtbx1q_u8(out_2, rem, self.indexes_2[i]) };
-                input = quotients;
-            }
+            // Three independent divides from `n`, plus one composed.
+            // The OoO scheduler can issue q1/q2/q3 in parallel, then q4
+            // chains off q2 (one extra ~5-op stage).
+            let q1 = div_85(n);
+            let q2 = div_85_sq(n);
+            let q3 = div_85_cube(n);
+            let q4 = div_85_sq(q2);
 
-            // Final digit (leading char in each block) — `input` is already
-            // < 85 lane-wise so we just splice it in.
-            let final_digit = unsafe { vreinterpretq_u8_u32(input) };
-            out_1 = unsafe { vqtbx1q_u8(out_1, final_digit, self.indexes_1[4]) };
+            // Five remainders, all independent given the q's. Each is
+            // one fused `mls.4s` (multiply-subtract) instruction:
+            //   d0 = q4
+            //   d1 = q3 - 85·q4
+            //   d2 = q2 - 85·q3
+            //   d3 = q1 - 85·q2
+            //   d4 = n  - 85·q1
+            let d0 = q4;
+            let d1 = unsafe { vmlsq_n_u32(q3, q4, 85) };
+            let d2 = unsafe { vmlsq_n_u32(q2, q3, 85) };
+            let d3 = unsafe { vmlsq_n_u32(q1, q2, 85) };
+            let d4 = unsafe { vmlsq_n_u32(n, q1, 85) };
+
+            // Reinterpret as u8 vectors so TBX can read individual bytes.
+            let d0_u8 = unsafe { vreinterpretq_u8_u32(d0) };
+            let d1_u8 = unsafe { vreinterpretq_u8_u32(d1) };
+            let d2_u8 = unsafe { vreinterpretq_u8_u32(d2) };
+            let d3_u8 = unsafe { vreinterpretq_u8_u32(d3) };
+            let d4_u8 = unsafe { vreinterpretq_u8_u32(d4) };
+
+            // Load splice indexes from .rodata. Each `vld1q_u8` is one
+            // load + the indexes get held in vector regs across the
+            // five-deep TBX chain.
+            let idx0 = unsafe { vld1q_u8(IDX_OUT_1[0].as_ptr()) };
+            let idx1 = unsafe { vld1q_u8(IDX_OUT_1[1].as_ptr()) };
+            let idx2 = unsafe { vld1q_u8(IDX_OUT_1[2].as_ptr()) };
+            let idx3 = unsafe { vld1q_u8(IDX_OUT_1[3].as_ptr()) };
+            let idx4 = unsafe { vld1q_u8(IDX_OUT_1[4].as_ptr()) };
+
+            let mut out_1 = unsafe { vdupq_n_u8(0) };
+            out_1 = unsafe { vqtbx1q_u8(out_1, d0_u8, idx0) };
+            out_1 = unsafe { vqtbx1q_u8(out_1, d1_u8, idx1) };
+            out_1 = unsafe { vqtbx1q_u8(out_1, d2_u8, idx2) };
+            out_1 = unsafe { vqtbx1q_u8(out_1, d3_u8, idx3) };
+            out_1 = unsafe { vqtbx1q_u8(out_1, d4_u8, idx4) };
+
+            let idx2_0 = unsafe { vld1q_u8(IDX_OUT_2[0].as_ptr()) };
+            let idx2_1 = unsafe { vld1q_u8(IDX_OUT_2[1].as_ptr()) };
+            let idx2_2 = unsafe { vld1q_u8(IDX_OUT_2[2].as_ptr()) };
+            let idx2_3 = unsafe { vld1q_u8(IDX_OUT_2[3].as_ptr()) };
+
+            let mut out_2 = unsafe { vdupq_n_u8(0) };
+            out_2 = unsafe { vqtbx1q_u8(out_2, d1_u8, idx2_0) };
+            out_2 = unsafe { vqtbx1q_u8(out_2, d2_u8, idx2_1) };
+            out_2 = unsafe { vqtbx1q_u8(out_2, d3_u8, idx2_2) };
+            out_2 = unsafe { vqtbx1q_u8(out_2, d4_u8, idx2_3) };
 
             out_1 = unsafe { byte_to_char85_neon(out_1) };
             out_2 = unsafe { byte_to_char85_neon(out_2) };

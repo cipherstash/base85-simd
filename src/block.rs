@@ -549,10 +549,10 @@ mod tests {
     #[test]
     fn decode_tail_round_trip() {
         for n in 1..=3usize {
-            let input: Vec<u8> = (0u8..=255)
-                .step_by(if n == 0 { 1 } else { 256 / n + 1 })
-                .take(n)
-                .collect();
+            // n ∈ {1, 2, 3}; step_by stride spreads `take(n)` samples across
+            // the byte range. `n == 0` would divide-by-zero, but it's
+            // excluded by the loop bounds.
+            let input: Vec<u8> = (0u8..=255).step_by(256 / n + 1).take(n).collect();
             let encoded = base85::encode(&input);
             let mut out = vec![0u8; n];
             decode_tail(encoded.as_bytes(), &mut out, 0).expect("valid encoding");

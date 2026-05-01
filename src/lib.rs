@@ -1,36 +1,4 @@
-//! Fast Base85 (RFC 1924 / Z85-style) encoding and decoding.
-//!
-//! On `aarch64` the encoder uses NEON intrinsics to process 16 input bytes
-//! per iteration. On other architectures and on the decode path, a portable
-//! scalar implementation is used. The output is byte-for-byte compatible
-//! with the [`base85`](https://crates.io/crates/base85) crate.
-//!
-//! # Alphabet
-//!
-//! ```text
-//! 0123456789
-//! ABCDEFGHIJKLMNOPQRSTUVWXYZ
-//! abcdefghijklmnopqrstuvwxyz
-//! !#$%&()*+-;<=>?@^_`{|}~
-//! ```
-//!
-//! # Tail handling
-//!
-//! Inputs whose length is not a multiple of 4 are encoded as
-//! `floor(len / 4) * 5 + (len % 4) + 1` characters. The trailing partial
-//! block is padded with zero bytes for encoding, and with the maximum digit
-//! (`~` = 84) for decoding — the choice ensures the discarded low bytes
-//! cannot perturb the kept high bytes.
-//!
-//! # Example
-//!
-//! ```
-//! let data = b"hello, world!";
-//! let encoded = base85_simd::encode(data);
-//! let decoded = base85_simd::decode(&encoded).unwrap();
-//! assert_eq!(decoded, data);
-//! ```
-
+#![doc = include_str!("../README.md")]
 #![deny(unsafe_op_in_unsafe_fn)]
 // Mission-critical lint config: production paths must not panic. Test code
 // opts back in via `#[cfg_attr(test, allow(...))]` at the module level.

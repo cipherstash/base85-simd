@@ -200,13 +200,20 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
 fn encode_into(input: &[u8], out: &mut [u8]) {
     use block::SseEncoder;
 
+    // Runtime feature gate: the SSE intrinsics carry
+    // `#[target_feature(enable = "sse4.1,ssse3")]`, so calling them on
+    // a CPU without those features is UB. Detect once at the entry
+    // point and route to the scalar fallback otherwise. This branch
+    // predicts perfectly so the cost is negligible.
+    if !(std::is_x86_feature_detected!("sse4.1") && std::is_x86_feature_detected!("ssse3")) {
+        encode_into_scalar(input, out);
+        return;
+    }
+
     let encoder = SseEncoder::new();
     let mut in_off = 0usize;
     let mut out_off = 0usize;
 
-    // 16-byte → 20-char SSE loop. (Currently a scalar-fallback stub
-    // inside `SseEncoder::encode_block_x4`; replace its body with
-    // SSSE3/SSE4.1 intrinsics to get the speedup.)
     while in_off.saturating_add(16) <= input.len() {
         let Some(in_chunk) = chunk_at::<16>(input, in_off) else {
             return;
@@ -214,10 +221,42 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
         let Some(out_chunk) = chunk_at_mut::<20>(out, out_off) else {
             return;
         };
-        encoder.encode_block_x4(in_chunk, out_chunk);
+        // SAFETY: we verified SSE4.1 + SSSE3 above.
+        unsafe { encoder.encode_block_x4(in_chunk, out_chunk) };
         in_off = in_off.saturating_add(16);
         out_off = out_off.saturating_add(20);
     }
+
+    while in_off.saturating_add(4) <= input.len() {
+        let Some(block) = chunk_at::<4>(input, in_off) else {
+            return;
+        };
+        let Some(chunk) = chunk_at_mut::<5>(out, out_off) else {
+            return;
+        };
+        encode_block(block, chunk);
+        in_off = in_off.saturating_add(4);
+        out_off = out_off.saturating_add(5);
+    }
+
+    let tail_in_len = input.len().saturating_sub(in_off);
+    if tail_in_len > 0 {
+        let tail_out_len = tail_in_len.saturating_add(1);
+        if let (Some(tail_in), Some(tail_out)) = (
+            input.get(in_off..in_off.saturating_add(tail_in_len)),
+            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
+        ) {
+            encode_tail(tail_in, tail_out);
+        }
+    }
+}
+
+/// Pure-scalar fallback used by the x86 path on CPUs lacking
+/// SSE4.1 + SSSE3 (e.g. very old Pentium 4-class hardware).
+#[cfg(target_arch = "x86_64")]
+fn encode_into_scalar(input: &[u8], out: &mut [u8]) {
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
 
     while in_off.saturating_add(4) <= input.len() {
         let Some(block) = chunk_at::<4>(input, in_off) else {
@@ -346,11 +385,17 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
 fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     use block::try_decode_block_x4;
 
+    // Runtime feature gate: the SSE intrinsics are gated on
+    // `target_feature(enable = "sse4.1,ssse3")`; calling them on a CPU
+    // lacking those features is UB. Detect once at the entry point.
+    if !(std::is_x86_feature_detected!("sse4.1") && std::is_x86_feature_detected!("ssse3")) {
+        return decode_into_scalar(input, out);
+    }
+
     let mut in_off = 0usize;
     let mut out_off = 0usize;
 
     while in_off + 20 <= input.len() && out_off + 16 <= out.len() {
-        // SAFETY: the slice arms below are checked by the loop guard.
         let Some(in_chunk) = chunk_at::<20>(input, in_off) else {
             return Ok(());
         };
@@ -358,7 +403,9 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
             return Ok(());
         };
 
-        if try_decode_block_x4(in_chunk, out_chunk).is_ok() {
+        // SAFETY: SSE4.1 + SSSE3 verified above.
+        let sse_ok = unsafe { try_decode_block_x4(in_chunk, out_chunk) }.is_ok();
+        if sse_ok {
             in_off += 20;
             out_off += 16;
         } else {
@@ -378,6 +425,39 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
         decode_block(block, chunk, in_off)?;
         in_off += 5;
         out_off += 4;
+    }
+
+    let tail_in_len = input.len().saturating_sub(in_off);
+    if tail_in_len > 0 {
+        let tail_out_len = tail_in_len.saturating_sub(1);
+        if let (Some(tail_in), Some(tail_out)) = (
+            input.get(in_off..in_off.saturating_add(tail_in_len)),
+            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
+        ) {
+            decode_tail(tail_in, tail_out, in_off)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Pure-scalar fallback used by the x86 decode path on CPUs lacking
+/// SSE4.1 + SSSE3.
+#[cfg(target_arch = "x86_64")]
+fn decode_into_scalar(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
+
+    while in_off.saturating_add(5) <= input.len() {
+        let Some(block) = chunk_at::<5>(input, in_off) else {
+            return Ok(());
+        };
+        let Some(chunk) = chunk_at_mut::<4>(out, out_off) else {
+            return Ok(());
+        };
+        decode_block(block, chunk, in_off)?;
+        in_off = in_off.saturating_add(5);
+        out_off = out_off.saturating_add(4);
     }
 
     let tail_in_len = input.len().saturating_sub(in_off);

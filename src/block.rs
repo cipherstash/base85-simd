@@ -15,7 +15,10 @@ pub(crate) const ALPHABET: &[u8; 85] =
 #[inline]
 pub(crate) fn byte_to_char85(x85: u8) -> u8 {
     debug_assert!(x85 < 85);
-    ALPHABET[x85 as usize]
+    // `x85` is a digit in [0, 84] by construction in every call site
+    // (each `n % 85` or final `n < 85` quotient). The `unwrap_or(b'0')`
+    // is defensive — never observed at runtime.
+    ALPHABET.get(x85 as usize).copied().unwrap_or(b'0')
 }
 
 #[inline]
@@ -92,25 +95,35 @@ pub(crate) fn decode_block(
 /// Encodes a 1..=3 byte tail. Output length is `input.len() + 1`.
 ///
 /// The tail is padded with zero bytes to form a full block, encoded, and
-/// only the first `input.len() + 1` characters are emitted.
+/// only the first `input.len() + 1` characters are emitted. Mismatched
+/// lengths are silently ignored (no panic) to keep this function on the
+/// no-panic production path.
 #[inline]
 pub(crate) fn encode_tail(input: &[u8], out: &mut [u8]) {
     debug_assert!((1..=3).contains(&input.len()));
     debug_assert_eq!(out.len(), input.len() + 1);
 
     let mut padded = [0u8; 4];
-    padded[..input.len()].copy_from_slice(input);
+    let Some(padded_head) = padded.get_mut(..input.len()) else {
+        return;
+    };
+    padded_head.copy_from_slice(input);
     let mut full = [0u8; 5];
     encode_block(&padded, &mut full);
-    out.copy_from_slice(&full[..input.len() + 1]);
+    let Some(emitted) = full.get(..input.len().saturating_add(1)) else {
+        return;
+    };
+    if out.len() == emitted.len() {
+        out.copy_from_slice(emitted);
+    }
 }
 
 /// Decodes a 2..=4 character tail. Output length is `input.len() - 1`.
 ///
 /// The tail is padded with `~` (digit value 84, the maximum) to form a full
-/// 5-char block, decoded, and only the first `input.len() - 1` bytes are kept.
-/// The padding choice is arithmetically chosen so that the kept bytes are
-/// independent of the padding (see crate-level docs).
+/// 5-char block, decoded, and only the first `input.len() - 1` bytes are
+/// kept. The padding choice ensures the kept bytes are independent of the
+/// padding (see crate-level docs).
 #[inline]
 pub(crate) fn decode_tail(
     input: &[u8],
@@ -121,10 +134,19 @@ pub(crate) fn decode_tail(
     debug_assert_eq!(out.len(), input.len() - 1);
 
     let mut padded = [b'~'; 5];
-    padded[..input.len()].copy_from_slice(input);
+    let Some(padded_head) = padded.get_mut(..input.len()) else {
+        return Ok(());
+    };
+    padded_head.copy_from_slice(input);
     let mut full = [0u8; 4];
     decode_block(&padded, &mut full, base_position)?;
-    out.copy_from_slice(&full[..input.len() - 1]);
+    let kept = input.len().saturating_sub(1);
+    let Some(emitted) = full.get(..kept) else {
+        return Ok(());
+    };
+    if out.len() == emitted.len() {
+        out.copy_from_slice(emitted);
+    }
     Ok(())
 }
 
@@ -137,13 +159,17 @@ pub(crate) use neon::{NeonEncoder, try_decode_block_x4};
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
+    // Indexing/slicing inside this module is over fixed-size arrays
+    // (`[u8; 16]`, `[u8; 20]`) with compile-time-constant bounds, so
+    // panic-on-OOB cannot occur at runtime.
+    #![allow(clippy::indexing_slicing)]
+
     use crate::ops::{div_85, div_85_cube, div_85_sq};
     use std::arch::aarch64::{
         uint8x16_t, uint8x16x2_t, uint32x4_t, vandq_u8, vbslq_u8, vceqq_u8, vcgtq_u8, vcltq_u32,
-        vcltq_u8, vdupq_n_u8, vld1q_u32, vld1q_u8, vld1q_u8_x2, vld1q_u8_x4, vmaxvq_u32,
-        vmaxvq_u8, vmlaq_n_u32, vmlsq_n_u32, vmulq_n_u32, vorrq_u8, vqtbl2q_u8, vqtbl4q_u8,
-        vqtbx1q_u8, vreinterpretq_u32_u8, vreinterpretq_u8_u32, vrev32q_u8, vst1q_lane_u32,
-        vst1q_u8, vsubq_u8,
+        vcltq_u8, vdupq_n_u8, vld1q_u8, vld1q_u8_x2, vld1q_u8_x4, vmaxvq_u32, vmaxvq_u8,
+        vmlaq_n_u32, vmlsq_n_u32, vmulq_n_u32, vorrq_u8, vqtbl2q_u8, vqtbl4q_u8, vqtbx1q_u8,
+        vreinterpretq_u32_u8, vreinterpretq_u8_u32, vrev32q_u8, vst1q_u8, vsubq_u8,
     };
 
     // Per-digit splice indexes, computed at compile time and loaded
@@ -188,15 +214,12 @@ mod neon {
 
         /// Encode exactly 16 input bytes into exactly 20 output bytes.
         ///
-        /// # Safety
-        ///
-        /// Caller must ensure `in_bytes.len() >= 16` and `out_bytes.len() >= 20`.
+        /// The fixed-size array references make all NEON load and store
+        /// bounds type-enforced — every intrinsic call below operates on
+        /// pointers known to be valid for at least 16 (or 20) bytes.
         #[inline]
-        pub(crate) unsafe fn encode_block_x4(&self, in_bytes: &[u8], out_bytes: &mut [u8]) {
-            debug_assert!(in_bytes.len() >= 16);
-            debug_assert!(out_bytes.len() >= 20);
-
-            let n = unsafe { load_u32x4_be(in_bytes) };
+        pub(crate) fn encode_block_x4(&self, in_bytes: &[u8; 16], out_bytes: &mut [u8; 20]) {
+            let n = load_u32x4_be(in_bytes);
 
             // Three independent divides from `n`, plus one composed.
             // The OoO scheduler can issue q1/q2/q3 in parallel, then q4
@@ -256,10 +279,18 @@ mod neon {
             out_1 = unsafe { byte_to_char85_neon(out_1) };
             out_2 = unsafe { byte_to_char85_neon(out_2) };
 
+            // Store: 16 bytes from `out_1` to out_bytes[0..16] (aligned-
+            // friendly via vst1q_u8), then 4 bytes from `out_2` lane-0
+            // copied byte-wise to avoid any *u32 alignment hazard.
             unsafe {
                 vst1q_u8(out_bytes.as_mut_ptr(), out_1);
-                let out_2_u32 = vreinterpretq_u32_u8(out_2);
-                vst1q_lane_u32::<0>(out_bytes.as_mut_ptr().add(16) as *mut u32, out_2_u32);
+                let mut tail_buf = [0u8; 16];
+                vst1q_u8(tail_buf.as_mut_ptr(), out_2);
+                std::ptr::copy_nonoverlapping(
+                    tail_buf.as_ptr(),
+                    out_bytes.as_mut_ptr().add(16),
+                    4,
+                );
             }
         }
     }
@@ -272,15 +303,8 @@ mod neon {
     /// - any of the four 5-char blocks decodes to a value > `u32::MAX`.
     ///
     /// On success, exactly 16 big-endian bytes are written to `out`.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure `input.len() >= 20` and `out.len() >= 16`.
     #[inline]
-    pub(crate) unsafe fn try_decode_block_x4(input: &[u8], out: &mut [u8]) -> Result<(), ()> {
-        debug_assert!(input.len() >= 20);
-        debug_assert!(out.len() >= 16);
-
+    pub(crate) fn try_decode_block_x4(input: &[u8; 20], out: &mut [u8; 16]) -> Result<(), ()> {
         // Load chars 0..16 directly; load chars 16..19 into the low 4 lanes
         // of a zero-padded vector so we can use a unified TBL pipeline.
         let chars_main = unsafe { vld1q_u8(input.as_ptr()) };
@@ -460,14 +484,15 @@ mod neon {
         unsafe { vbslq_u8(mask_lt64, res_lo, res_hi) }
     }
 
-    /// Loads 16 bytes and reinterprets as 4 big-endian u32s. Compiles to a
-    /// single `ldr q + rev32.16b` pair.
+    /// Loads 16 bytes and reinterprets as 4 big-endian u32s. Uses the
+    /// byte-aligned `vld1q_u8` rather than `vld1q_u32` (which would
+    /// require 4-byte alignment of the source pointer that a `&[u8]`
+    /// can't guarantee). Compiles to `ldr q + rev32.16b`.
     #[inline]
-    unsafe fn load_u32x4_be(bytes: &[u8]) -> uint32x4_t {
+    fn load_u32x4_be(bytes: &[u8; 16]) -> uint32x4_t {
         unsafe {
-            let raw = vld1q_u32(bytes.as_ptr() as *const u32);
-            let raw_bytes = vreinterpretq_u8_u32(raw);
-            let swapped = vrev32q_u8(raw_bytes);
+            let raw = vld1q_u8(bytes.as_ptr());
+            let swapped = vrev32q_u8(raw);
             vreinterpretq_u32_u8(swapped)
         }
     }

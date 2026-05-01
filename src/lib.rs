@@ -32,6 +32,16 @@
 //! ```
 
 #![deny(unsafe_op_in_unsafe_fn)]
+// Mission-critical lint config: production paths must not panic. Test code
+// opts back in via `#[cfg_attr(test, allow(...))]` at the module level.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::panic))]
+#![cfg_attr(not(test), deny(clippy::indexing_slicing))]
+#![cfg_attr(not(test), deny(clippy::todo))]
+#![cfg_attr(not(test), deny(clippy::unimplemented))]
+#![cfg_attr(not(test), deny(clippy::unreachable))]
+#![warn(clippy::missing_safety_doc)]
 
 mod block;
 mod ops;
@@ -122,57 +132,96 @@ pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
 // Internal: pre-sized buffer fills
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Borrow `slice[off..off+N]` as `&[u8; N]` if it fits. `None` otherwise —
+/// the production paths treat `None` as an unrecoverable caller bug and
+/// return early instead of panicking.
+#[inline]
+fn chunk_at<const N: usize>(slice: &[u8], off: usize) -> Option<&[u8; N]> {
+    let end = off.checked_add(N)?;
+    let s = slice.get(off..end)?;
+    <&[u8; N]>::try_from(s).ok()
+}
+
+#[inline]
+fn chunk_at_mut<const N: usize>(slice: &mut [u8], off: usize) -> Option<&mut [u8; N]> {
+    let end = off.checked_add(N)?;
+    let s = slice.get_mut(off..end)?;
+    <&mut [u8; N]>::try_from(s).ok()
+}
+
 #[cfg(target_arch = "aarch64")]
 fn encode_into(input: &[u8], out: &mut [u8]) {
     use block::NeonEncoder;
 
     let encoder = NeonEncoder::new();
-    let mut in_off = 0;
-    let mut out_off = 0;
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
 
-    // Process 16-byte chunks with NEON.
-    while in_off + 16 <= input.len() {
-        // SAFETY: bounds checked in the loop condition; out has capacity for
-        // at least 20 more bytes since out_len = ceil(in_len / 4) * 5.
-        unsafe {
-            encoder.encode_block_x4(&input[in_off..], &mut out[out_off..]);
-        }
-        in_off += 16;
-        out_off += 20;
+    // Process 16-byte chunks with NEON. The fixed-size array references
+    // make the SIMD load/store bounds type-enforced.
+    while in_off.saturating_add(16) <= input.len() {
+        let Some(in_chunk) = chunk_at::<16>(input, in_off) else {
+            return;
+        };
+        let Some(out_chunk) = chunk_at_mut::<20>(out, out_off) else {
+            return;
+        };
+        encoder.encode_block_x4(in_chunk, out_chunk);
+        in_off = in_off.saturating_add(16);
+        out_off = out_off.saturating_add(20);
     }
 
-    // Process remaining 4-byte blocks scalar.
-    while in_off + 4 <= input.len() {
-        let block: &[u8; 4] = (&input[in_off..in_off + 4]).try_into().unwrap();
-        let chunk: &mut [u8; 5] = (&mut out[out_off..out_off + 5]).try_into().unwrap();
+    // Mop up any remaining whole 4-byte blocks with scalar.
+    while in_off.saturating_add(4) <= input.len() {
+        let Some(block) = chunk_at::<4>(input, in_off) else {
+            return;
+        };
+        let Some(chunk) = chunk_at_mut::<5>(out, out_off) else {
+            return;
+        };
         encode_block(block, chunk);
-        in_off += 4;
-        out_off += 5;
+        in_off = in_off.saturating_add(4);
+        out_off = out_off.saturating_add(5);
     }
 
-    // Tail.
-    let tail = &input[in_off..];
-    if !tail.is_empty() {
-        encode_tail(tail, &mut out[out_off..out_off + tail.len() + 1]);
+    let tail_in_len = input.len().saturating_sub(in_off);
+    if tail_in_len > 0 {
+        let tail_out_len = tail_in_len.saturating_add(1);
+        if let (Some(tail_in), Some(tail_out)) = (
+            input.get(in_off..in_off.saturating_add(tail_in_len)),
+            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
+        ) {
+            encode_tail(tail_in, tail_out);
+        }
     }
 }
 
 #[cfg(not(target_arch = "aarch64"))]
 fn encode_into(input: &[u8], out: &mut [u8]) {
-    let mut in_off = 0;
-    let mut out_off = 0;
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
 
-    while in_off + 4 <= input.len() {
-        let block: &[u8; 4] = (&input[in_off..in_off + 4]).try_into().unwrap();
-        let chunk: &mut [u8; 5] = (&mut out[out_off..out_off + 5]).try_into().unwrap();
+    while in_off.saturating_add(4) <= input.len() {
+        let Some(block) = chunk_at::<4>(input, in_off) else {
+            return;
+        };
+        let Some(chunk) = chunk_at_mut::<5>(out, out_off) else {
+            return;
+        };
         encode_block(block, chunk);
-        in_off += 4;
-        out_off += 5;
+        in_off = in_off.saturating_add(4);
+        out_off = out_off.saturating_add(5);
     }
 
-    let tail = &input[in_off..];
-    if !tail.is_empty() {
-        encode_tail(tail, &mut out[out_off..out_off + tail.len() + 1]);
+    let tail_in_len = input.len().saturating_sub(in_off);
+    if tail_in_len > 0 {
+        let tail_out_len = tail_in_len.saturating_add(1);
+        if let (Some(tail_in), Some(tail_out)) = (
+            input.get(in_off..in_off.saturating_add(tail_in_len)),
+            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
+        ) {
+            encode_tail(tail_in, tail_out);
+        }
     }
 }
 
@@ -180,42 +229,62 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
 fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     use block::try_decode_block_x4;
 
-    let mut in_off = 0;
-    let mut out_off = 0;
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
 
-    // Process 20-char (4-block) chunks with NEON. On any per-chunk failure
-    // (invalid char or u32 overflow) we fall back to scalar for the whole
-    // chunk so the precise DecodeError surfaces with the correct position.
-    while in_off + 20 <= input.len() {
-        // SAFETY: in_off + 20 <= input.len() and out has been sized so that
-        // out_off + 16 <= out.len() whenever in_off + 20 <= input.len().
-        let neon_ok =
-            unsafe { try_decode_block_x4(&input[in_off..], &mut out[out_off..]) }.is_ok();
+    // 20-char (4-block) NEON path. On per-chunk failure (invalid char or
+    // u32 overflow), replay the same chunk scalar so DecodeError surfaces
+    // the precise failing byte position.
+    while in_off.saturating_add(20) <= input.len() {
+        let neon_ok = {
+            let (Some(in_chunk), Some(out_chunk)) = (
+                chunk_at::<20>(input, in_off),
+                chunk_at_mut::<16>(out, out_off),
+            ) else {
+                return Ok(());
+            };
+            try_decode_block_x4(in_chunk, out_chunk).is_ok()
+        };
+
         if neon_ok {
-            in_off += 20;
-            out_off += 16;
+            in_off = in_off.saturating_add(20);
+            out_off = out_off.saturating_add(16);
         } else {
             for _ in 0..4 {
-                let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
-                let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
+                let Some(block) = chunk_at::<5>(input, in_off) else {
+                    return Ok(());
+                };
+                let Some(chunk) = chunk_at_mut::<4>(out, out_off) else {
+                    return Ok(());
+                };
                 decode_block(block, chunk, in_off)?;
-                in_off += 5;
-                out_off += 4;
+                in_off = in_off.saturating_add(5);
+                out_off = out_off.saturating_add(4);
             }
         }
     }
 
-    while in_off + 5 <= input.len() {
-        let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
-        let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
+    while in_off.saturating_add(5) <= input.len() {
+        let Some(block) = chunk_at::<5>(input, in_off) else {
+            return Ok(());
+        };
+        let Some(chunk) = chunk_at_mut::<4>(out, out_off) else {
+            return Ok(());
+        };
         decode_block(block, chunk, in_off)?;
-        in_off += 5;
-        out_off += 4;
+        in_off = in_off.saturating_add(5);
+        out_off = out_off.saturating_add(4);
     }
 
-    let tail = &input[in_off..];
-    if !tail.is_empty() {
-        decode_tail(tail, &mut out[out_off..out_off + tail.len() - 1], in_off)?;
+    let tail_in_len = input.len().saturating_sub(in_off);
+    if tail_in_len > 0 {
+        let tail_out_len = tail_in_len.saturating_sub(1);
+        if let (Some(tail_in), Some(tail_out)) = (
+            input.get(in_off..in_off.saturating_add(tail_in_len)),
+            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
+        ) {
+            decode_tail(tail_in, tail_out, in_off)?;
+        }
     }
 
     Ok(())
@@ -223,29 +292,44 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
 
 #[cfg(not(target_arch = "aarch64"))]
 fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
-    let mut in_off = 0;
-    let mut out_off = 0;
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
 
-    while in_off + 5 <= input.len() {
-        let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
-        let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
+    while in_off.saturating_add(5) <= input.len() {
+        let Some(block) = chunk_at::<5>(input, in_off) else {
+            return Ok(());
+        };
+        let Some(chunk) = chunk_at_mut::<4>(out, out_off) else {
+            return Ok(());
+        };
         decode_block(block, chunk, in_off)?;
-        in_off += 5;
-        out_off += 4;
+        in_off = in_off.saturating_add(5);
+        out_off = out_off.saturating_add(4);
     }
 
-    let tail = &input[in_off..];
-    if !tail.is_empty() {
-        decode_tail(tail, &mut out[out_off..out_off + tail.len() - 1], in_off)?;
+    let tail_in_len = input.len().saturating_sub(in_off);
+    if tail_in_len > 0 {
+        let tail_out_len = tail_in_len.saturating_sub(1);
+        if let (Some(tail_in), Some(tail_out)) = (
+            input.get(in_off..in_off.saturating_add(tail_in_len)),
+            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
+        ) {
+            decode_tail(tail_in, tail_out, in_off)?;
+        }
     }
 
     Ok(())
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use quickcheck::quickcheck;
+    use quickcheck::{Gen, QuickCheck, quickcheck};
+
+    // ──────────────────────────────────────────────────────────────────
+    // Section A — Basic correctness
+    // ──────────────────────────────────────────────────────────────────
 
     #[test]
     fn encode_matches_reference_full_block() {
@@ -263,10 +347,17 @@ mod tests {
         assert_eq!(decode("").unwrap(), Vec::<u8>::new());
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // Section B — Round-trip across every relevant length
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Round-trip for every length 0..=256, with content that varies per
+    /// position. Catches off-by-one in tail handling, NEON-chunk transitions
+    /// (16, 17, 19, 20, 21, …), and 4-byte block transitions.
     #[test]
-    fn round_trip_short_inputs() {
-        for n in 0..=64 {
-            let input: Vec<u8> = (0..n).map(|i| i as u8).collect();
+    fn round_trip_every_length_up_to_256() {
+        for n in 0..=256usize {
+            let input: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(7).wrapping_add(11)).collect();
             let encoded = encode(&input);
             assert_eq!(encoded, base85::encode(&input), "encode mismatch len={n}");
             let decoded = decode(&encoded).unwrap();
@@ -274,75 +365,267 @@ mod tests {
         }
     }
 
+    /// Lengths surrounding every chunk boundary the impl cares about:
+    /// 4-byte block, 16-byte SIMD encode, 20-char SIMD decode chunk.
     #[test]
-    fn round_trip_long_inputs() {
-        // Exercises both the NEON decode chunk path (20+ chars) and the
-        // scalar tail. 1024 bytes → 1280 chars = 64 NEON chunks.
-        for n in [20usize, 80, 256, 1024, 4096] {
-            let input: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(31)) as u8).collect();
-            let encoded = encode(&input);
-            assert_eq!(encoded, base85::encode(&input), "encode mismatch len={n}");
+    fn round_trip_chunk_boundary_lengths() {
+        let mut sizes: Vec<usize> = Vec::new();
+        for base in [0usize, 4, 8, 12, 16, 20, 32, 64, 96, 128, 192, 256, 1024, 4096] {
+            for delta in [0i32, -1, 1, -2, 2, -3, 3] {
+                let n = base as i32 + delta;
+                if n >= 0 {
+                    sizes.push(n as usize);
+                }
+            }
+        }
+        sizes.sort_unstable();
+        sizes.dedup();
+        for n in sizes {
+            let input: Vec<u8> = (0..n).map(|i| (i as u8) ^ 0xA5).collect();
+            assert_eq!(decode(&encode(&input)).unwrap(), input, "boundary len={n}");
+        }
+    }
+
+    /// 1 MiB stress test with deterministic content.
+    #[test]
+    fn round_trip_one_megabyte() {
+        let input: Vec<u8> = (0..(1u32 << 20))
+            .map(|i| (i.wrapping_mul(2_654_435_761)) as u8)
+            .collect();
+        let encoded = encode(&input);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, input);
+        assert_eq!(encoded, base85::encode(&input));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Section C — Boundary u32 values per single block
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Round-trip every "interesting" u32 single-block value: zeros,
+    /// powers of 85, u32::MAX-adjacent. Each is encoded as a 5-char
+    /// block (4 input bytes BE) and round-tripped.
+    #[test]
+    fn round_trip_boundary_u32_values() {
+        let mut values: Vec<u32> = Vec::new();
+        values.extend([0, 1, 84, 85, 86, u32::MAX, u32::MAX - 1, u32::MAX - 84]);
+        for k in 0..32 {
+            values.push(1u32 << k);
+            values.push((1u32 << k).wrapping_sub(1));
+        }
+        for k in 0..=4u32 {
+            values.push(85u32.pow(k));
+            if 85u32.pow(k) > 0 {
+                values.push(85u32.pow(k).saturating_sub(1));
+            }
+        }
+        // The exact encoder boundary cases.
+        values.push(82 * 85u32.pow(4));
+        values.push(82 * 85u32.pow(4) + 14_516_045);
+
+        for &v in &values {
+            let bytes = v.to_be_bytes();
+            let encoded = encode(&bytes);
+            assert_eq!(encoded.len(), 5);
+            assert_eq!(encoded, base85::encode(&bytes), "encode v={v}");
             let decoded = decode(&encoded).unwrap();
-            assert_eq!(decoded, input, "round-trip mismatch len={n}");
+            assert_eq!(decoded, bytes, "round-trip v={v}");
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Section D — Adversarial decode: invalid char & overflow at every
+    //              position must surface DecodeError with that position
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn invalid_char_at_every_position_reports_correct_position() {
+        // 100-byte input → 125 chars (whole-block-aligned at 25 NEON chunks).
+        let input: Vec<u8> = (0..100u32).map(|i| i as u8).collect();
+        let encoded_str = encode(&input);
+
+        for pos in 0..encoded_str.len() {
+            let mut buf = encoded_str.clone().into_bytes();
+            buf[pos] = b' '; // ' ' is not in the alphabet
+            let s = std::str::from_utf8(&buf).unwrap();
+            let err = decode(s).unwrap_err();
+            match err {
+                DecodeError::InvalidChar { byte, position } => {
+                    assert_eq!(byte, b' ', "wrong byte reported at pos={pos}");
+                    // Position must be the position of the invalid char.
+                    // For NEON-fallback chunks, the scalar replay walks the
+                    // whole 20-char window and reports the exact byte.
+                    assert_eq!(position, pos, "wrong position reported for pos={pos}");
+                }
+                other => panic!("expected InvalidChar at pos={pos}, got {other:?}"),
+            }
         }
     }
 
     #[test]
-    fn decode_matches_reference_for_long_input() {
-        // Reference encodes, we decode — verifies our NEON decode against
-        // an independent implementation, not just our own encode.
-        let input: Vec<u8> = (0..1024u32).map(|i| (i * 17) as u8).collect();
-        let encoded_by_ref = base85::encode(&input);
-        let decoded_by_us = decode(&encoded_by_ref).unwrap();
-        assert_eq!(decoded_by_us, input);
+    fn overflow_block_at_every_position_reports_block_start() {
+        // Build a long run of valid blocks, then place an overflowing
+        // block at each block-aligned position and verify Overflow
+        // surfaces with the correct position.
+        let valid_block = "00000"; // encodes 0u32
+        let overflow_block = "|NsC1"; // u32::MAX + 1 (one past max valid)
+        let n_blocks = 8usize; // 40 chars = 2 NEON chunks
+
+        for bad_block_idx in 0..n_blocks {
+            let mut s = String::new();
+            for i in 0..n_blocks {
+                if i == bad_block_idx {
+                    s.push_str(overflow_block);
+                } else {
+                    s.push_str(valid_block);
+                }
+            }
+            let err = decode(&s).unwrap_err();
+            match err {
+                DecodeError::Overflow { position } => {
+                    assert_eq!(
+                        position,
+                        bad_block_idx * 5,
+                        "wrong overflow position for block {bad_block_idx}",
+                    );
+                }
+                other => panic!("expected Overflow at block {bad_block_idx}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
-    fn decode_invalid_char_in_neon_chunk() {
-        // Inject an invalid char inside what would be the second NEON
-        // chunk so the fallback path has to kick in mid-stream.
-        let input: Vec<u8> = (0..40).map(|i| i as u8).collect();
-        let mut encoded = encode(&input).into_bytes();
-        encoded[25] = b' '; // position 25 is inside the 2nd 20-char chunk
-        let s = std::str::from_utf8(&encoded).unwrap();
-        let err = decode(s).unwrap_err();
-        assert!(
-            matches!(err, DecodeError::InvalidChar { byte: b' ', position: 25 }),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn decode_overflow_is_caught() {
-        // "|NsC1" decodes to u32::MAX + 1 (since "|NsC0" encodes u32::MAX).
-        // Pad with a valid block to land in the NEON path.
-        let mut s = String::from("00000"); // valid leading block (0u32)
-        s.push_str("|NsC1"); // overflowing block
-        s.push_str("00000"); // valid trailing block
-        s.push_str("00000"); // 4 blocks total → exactly one NEON chunk
-        let err = decode(&s).unwrap_err();
-        assert!(matches!(err, DecodeError::Overflow { .. }), "got {err:?}");
-    }
-
-    #[test]
-    fn decode_invalid_char() {
+    fn decode_invalid_char_at_position_2() {
         let err = decode("00 00").unwrap_err();
         assert!(matches!(
             err,
-            DecodeError::InvalidChar {
-                byte: b' ',
-                position: 2
-            }
+            DecodeError::InvalidChar { byte: b' ', position: 2 }
         ));
     }
 
+    /// All ASCII bytes outside the alphabet must be rejected as InvalidChar.
     #[test]
-    fn decode_invalid_length() {
-        // length % 5 == 1 is impossible for a valid encoding
-        let err = decode("0").unwrap_err();
-        assert!(matches!(err, DecodeError::InvalidLength { len: 1 }));
+    fn every_non_alphabet_ascii_is_rejected() {
+        let alphabet = block::ALPHABET;
+        let mut alphabet_set = [false; 256];
+        for &c in alphabet {
+            alphabet_set[c as usize] = true;
+        }
+        // Test ASCII range (and beyond) — any byte not in the alphabet must
+        // produce InvalidChar when placed inside a 5-char block.
+        for b in 0u8..=127 {
+            if alphabet_set[b as usize] {
+                continue;
+            }
+            let bytes = [b'0', b, b'0', b'0', b'0'];
+            let s = std::str::from_utf8(&bytes).unwrap();
+            let err = decode(s).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    DecodeError::InvalidChar { byte, position: 1 } if byte == b
+                ),
+                "byte {b:#04x} should be rejected, got {err:?}"
+            );
+        }
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // Section E — Length-rule rejections
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_rejects_invalid_lengths() {
+        // length % 5 == 1 is impossible for a valid encoding (partial blocks
+        // are at least 2 chars).
+        for len in [1usize, 6, 11, 26, 101] {
+            let s = "0".repeat(len);
+            let err = decode(&s).unwrap_err();
+            assert!(
+                matches!(err, DecodeError::InvalidLength { len: actual } if actual == len),
+                "len={len} should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_accepts_valid_partial_block_lengths() {
+        // length % 5 ∈ {0, 2, 3, 4} are valid.
+        for &(input_len, expected_encoded_len) in &[(1usize, 2), (2, 3), (3, 4), (4, 5)] {
+            let input: Vec<u8> = (0..input_len as u8).collect();
+            let encoded = encode(&input);
+            assert_eq!(encoded.len(), expected_encoded_len);
+            assert_eq!(decode(&encoded).unwrap(), input);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Section F — Output validity properties
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Every byte the encoder emits must be in the base85 alphabet.
+    #[test]
+    fn encoded_output_is_always_in_alphabet() {
+        let mut alphabet_set = [false; 256];
+        for &c in block::ALPHABET {
+            alphabet_set[c as usize] = true;
+        }
+        for n in 0..=200usize {
+            let input: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(13)).collect();
+            let encoded = encode(&input);
+            for (i, b) in encoded.bytes().enumerate() {
+                assert!(
+                    alphabet_set[b as usize],
+                    "byte {b:#04x} at pos {i} (input len {n}) is not in alphabet"
+                );
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Section G — Property tests with elevated iteration counts
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Quickcheck round-trip with high iteration count (10_000 cases) and
+    /// generator size 1024 to exercise inputs across many NEON chunks.
+    #[test]
+    fn quickcheck_round_trip_high_iter() {
+        fn prop(input: Vec<u8>) -> bool {
+            let encoded = encode(&input);
+            decode(&encoded).map(|d| d == input).unwrap_or(false)
+        }
+        QuickCheck::new()
+            .r#gen(Gen::new(1024))
+            .tests(10_000)
+            .quickcheck(prop as fn(Vec<u8>) -> bool);
+    }
+
+    #[test]
+    fn quickcheck_encode_matches_reference_high_iter() {
+        fn prop(input: Vec<u8>) -> bool {
+            encode(&input) == base85::encode(&input)
+        }
+        QuickCheck::new()
+            .r#gen(Gen::new(1024))
+            .tests(10_000)
+            .quickcheck(prop as fn(Vec<u8>) -> bool);
+    }
+
+    /// Reference encodes, we decode — independent-implementation parity
+    /// that doesn't share an encoder with the property under test.
+    #[test]
+    fn quickcheck_decode_against_reference_encode() {
+        fn prop(input: Vec<u8>) -> bool {
+            let encoded = base85::encode(&input);
+            decode(&encoded).map(|d| d == input).unwrap_or(false)
+        }
+        QuickCheck::new()
+            .r#gen(Gen::new(1024))
+            .tests(10_000)
+            .quickcheck(prop as fn(Vec<u8>) -> bool);
+    }
+
+    // Existing low-iter quickchecks retained for fast feedback.
     quickcheck! {
         fn round_trip_prop(input: Vec<u8>) -> bool {
             let encoded = encode(&input);
@@ -351,6 +634,33 @@ mod tests {
 
         fn encode_matches_reference(input: Vec<u8>) -> bool {
             encode(&input) == base85::encode(&input)
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Section H — NEON path direct exercise
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn neon_chunk_with_invalid_char_at_each_position() {
+        // For every byte position 0..20 within a NEON chunk, plant an
+        // invalid char and verify the fallback reports the right position.
+        let input: Vec<u8> = (0..16u32).map(|i| i as u8).collect();
+        let encoded_str = encode(&input);
+        assert_eq!(encoded_str.len(), 20);
+
+        for pos in 0..20 {
+            let mut buf = encoded_str.clone().into_bytes();
+            buf[pos] = b'.';
+            let s = std::str::from_utf8(&buf).unwrap();
+            let err = decode(s).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    DecodeError::InvalidChar { byte: b'.', position: p } if p == pos
+                ),
+                "pos={pos}: got {err:?}"
+            );
         }
     }
 }

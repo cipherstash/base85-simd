@@ -74,18 +74,49 @@ strictly more diagnostic information. Code that pattern-matches on
 
 ## Benchmarks
 
-Run with:
+Apple M-series (aarch64), `cargo bench --bench encode`, criterion, release
+profile, single-threaded. Times are the criterion-reported median; throughput
+is computed from the median.
+
+### Encode
+
+| size  | `base85` time | `base85-simd` time | speedup | `base85-simd` throughput |
+|-------|--------------:|-------------------:|--------:|-------------------------:|
+| 16 B  | 17.4 ns       | 16.3 ns            | 1.07×   | ~940 MiB/s               |
+| 64 B  | 33.0 ns       | 22.6 ns            | 1.46×   | 2.71 GiB/s               |
+| 256 B | 115.7 ns      | 73.2 ns            | 1.58×   | 3.26 GiB/s               |
+| 1 KiB | 378.3 ns      | 225.1 ns           | 1.68×   | 4.24 GiB/s               |
+| 16 KiB| 5.56 µs       | 3.60 µs            | 1.55×   | 4.24 GiB/s               |
+| 256 KiB| 89.3 µs      | 55.4 µs            | 1.61×   | 4.41 GiB/s               |
+| 1 MiB | 356 µs        | 222 µs             | 1.61×   | 4.40 GiB/s               |
+
+### Decode
+
+| size  | `base85` time | `base85-simd` time | speedup | `base85-simd` throughput |
+|-------|--------------:|-------------------:|--------:|-------------------------:|
+| 16 B  | 32.4 ns       | 14.8 ns            | 2.18×   | ~1.0 GiB/s               |
+| 64 B  | 123.5 ns      | 24.6 ns            | 5.02×   | 2.42 GiB/s               |
+| 256 B | 579 ns        | 57.6 ns            | 10.05×  | 4.14 GiB/s               |
+| 1 KiB | 2.27 µs       | 226 ns             | 10.06×  | 4.22 GiB/s               |
+| 16 KiB| 36.8 µs       | 3.49 µs            | 10.55×  | 4.38 GiB/s               |
+| 256 KiB| 591 µs       | 54.3 µs            | 10.89×  | 4.50 GiB/s               |
+| 1 MiB | 2.28 ms       | 217.6 µs           | 10.49×  | 4.49 GiB/s               |
+
+### Steady-state summary
+
+At sizes large enough to amortise loop setup (≥ 256 B), `base85-simd`
+sustains **~4.4 GiB/s** for both encode and decode on Apple M-series,
+roughly **1.6× faster** than the reference for encode and **~10×
+faster** for decode. The decode advantage comes from `TBL`-based ASCII
+→ digit lookup that replaces the reference's per-character branchy
+match; the encode advantage comes from 4-lane parallel `divmod 85`
+plus `TBX`-based digit → ASCII / output permutation.
+
+Reproduce with:
 
 ```sh
 cargo bench --bench encode
 ```
-
-Sample results (Apple M-series, 1 KB input):
-
-| Operation | `base85` | `base85-simd` | speedup |
-|-----------|----------|---------------|---------|
-| encode    | 361 ns   | 221 ns        | 1.6×    |
-| decode    | 2.33 µs  | 230 ns        | 10×     |
 
 ## License
 

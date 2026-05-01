@@ -303,8 +303,17 @@ mod neon {
     /// - any of the four 5-char blocks decodes to a value > `u32::MAX`.
     ///
     /// On success, exactly 16 big-endian bytes are written to `out`.
+    ///
+    /// # Safety
+    ///
+    /// `input` must point to at least 20 readable bytes; `out` must point
+    /// to at least 16 writable bytes. (We take open slices rather than
+    /// `&[u8; 20]` / `&mut [u8; 16]` because the fixed-array form costs
+    /// ~4× on the hot decode loop — see the comment in `decode_into`.)
     #[inline]
-    pub(crate) fn try_decode_block_x4(input: &[u8; 20], out: &mut [u8; 16]) -> Result<(), ()> {
+    pub(crate) unsafe fn try_decode_block_x4(input: &[u8], out: &mut [u8]) -> Result<(), ()> {
+        debug_assert!(input.len() >= 20);
+        debug_assert!(out.len() >= 16);
         // Load chars 0..16 directly; load chars 16..19 into the low 4 lanes
         // of a zero-padded vector so we can use a unified TBL pipeline.
         let chars_main = unsafe { vld1q_u8(input.as_ptr()) };

@@ -1,13 +1,15 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
+const SIZES: &[usize] = &[16, 64, 256, 1024, 16 * 1024, 256 * 1024, 1024 * 1024];
+
 fn make_input(len: usize) -> Vec<u8> {
     (0..len).map(|i| i as u8).collect()
 }
 
 fn bench_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode");
-    for &size in &[16usize, 64, 256, 1024, 16 * 1024] {
+    for &size in SIZES {
         let input = make_input(size);
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::new("base85", size), &input, |b, input| {
@@ -22,7 +24,7 @@ fn bench_encode(c: &mut Criterion) {
 
 fn bench_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode");
-    for &size in &[16usize, 64, 256, 1024, 16 * 1024] {
+    for &size in SIZES {
         let input = make_input(size);
         let encoded = base85::encode(&input);
         group.throughput(Throughput::Bytes(size as u64));

@@ -18,6 +18,14 @@
 //! default target-feature set (`x86_64-unknown-linux-gnu` defaults to
 //! just SSE2). Callers must perform a runtime feature detection via
 //! `std::is_x86_feature_detected!` before invoking.
+//!
+//! The inner `unsafe { ... }` blocks below are required on Rust 1.85
+//! (the declared MSRV) because `unsafe_op_in_unsafe_fn` still applies
+//! to target-feature-gated intrinsics there. Newer toolchains relax
+//! this and may report the blocks as redundant — hence the
+//! module-level `unused_unsafe` allow.
+
+#![allow(unused_unsafe)]
 
 use std::arch::x86_64::{
     __m128i, _mm_blend_epi16, _mm_mul_epu32, _mm_set1_epi32, _mm_shuffle_epi32, _mm_srli_epi32,
@@ -83,26 +91,30 @@ pub(crate) unsafe fn div_85_cube(input: __m128i) -> __m128i {
 #[inline]
 #[target_feature(enable = "sse4.1,ssse3")]
 unsafe fn div_magic<const MAGIC: u32, const SHIFT: i32>(input: __m128i) -> __m128i {
-    let magic = _mm_set1_epi32(MAGIC as i32);
+    // SAFETY (1.85 MSRV): caller has SSE4.1+SSSE3; all intrinsics below
+    // are gated on those features.
+    unsafe {
+        let magic = _mm_set1_epi32(MAGIC as i32);
 
-    // Even-lane multiply (touches input lanes 0 and 2).
-    let even = _mm_mul_epu32(input, magic);
-    // Shift right by 32 in u64 view to bring lanes 1 and 3 into
-    // the low u32 of each u64 lane, then multiply.
-    let input_odd = _mm_srli_epi64::<32>(input);
-    let odd = _mm_mul_epu32(input_odd, magic);
+        // Even-lane multiply (touches input lanes 0 and 2).
+        let even = _mm_mul_epu32(input, magic);
+        // Shift right by 32 in u64 view to bring lanes 1 and 3 into
+        // the low u32 of each u64 lane, then multiply.
+        let input_odd = _mm_srli_epi64::<32>(input);
+        let odd = _mm_mul_epu32(input_odd, magic);
 
-    // 0b11_11_01_01 picks lane 1 / lane 1 / lane 3 / lane 3 — i.e.
-    // broadcasts the high u32 of each u64 product across the pair.
-    let even_hi = _mm_shuffle_epi32::<0b11_11_01_01>(even);
-    let odd_hi = _mm_shuffle_epi32::<0b11_11_01_01>(odd);
+        // 0b11_11_01_01 picks lane 1 / lane 1 / lane 3 / lane 3 — i.e.
+        // broadcasts the high u32 of each u64 product across the pair.
+        let even_hi = _mm_shuffle_epi32::<0b11_11_01_01>(even);
+        let odd_hi = _mm_shuffle_epi32::<0b11_11_01_01>(odd);
 
-    // Blend at u16 granularity: 0xCC = 0b1100_1100 picks the upper
-    // u16 pair (i.e. odd_hi) for lanes 1 and 3 of the u32 view, and
-    // the lower (even_hi) for lanes 0 and 2.
-    let combined = _mm_blend_epi16::<0xCC>(even_hi, odd_hi);
+        // Blend at u16 granularity: 0xCC = 0b1100_1100 picks the upper
+        // u16 pair (i.e. odd_hi) for lanes 1 and 3 of the u32 view, and
+        // the lower (even_hi) for lanes 0 and 2.
+        let combined = _mm_blend_epi16::<0xCC>(even_hi, odd_hi);
 
-    _mm_srli_epi32::<SHIFT>(combined)
+        _mm_srli_epi32::<SHIFT>(combined)
+    }
 }
 
 #[cfg(test)]

@@ -540,6 +540,14 @@ mod sse {
     //! `crate::encode_into`) does a one-shot
     //! `is_x86_feature_detected!` check before invoking and falls
     //! back to scalar if the host CPU lacks the features.
+    //!
+    //! Inner `unsafe { ... }` blocks are required on Rust 1.85 (MSRV)
+    //! for calls to target-feature-gated intrinsics inside an
+    //! `unsafe fn`. Newer toolchains relax this and may flag those
+    //! blocks as redundant — hence the module-level `unused_unsafe`
+    //! allow.
+
+    #![allow(unused_unsafe)]
 
     use crate::ops::{div_85, div_85_cube, div_85_sq};
     use std::arch::x86_64::{

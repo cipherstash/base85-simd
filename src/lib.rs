@@ -176,6 +176,52 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
+    use block::try_decode_block_x4;
+
+    let mut in_off = 0;
+    let mut out_off = 0;
+
+    // Process 20-char (4-block) chunks with NEON. On any per-chunk failure
+    // (invalid char or u32 overflow) we fall back to scalar for the whole
+    // chunk so the precise DecodeError surfaces with the correct position.
+    while in_off + 20 <= input.len() {
+        // SAFETY: in_off + 20 <= input.len() and out has been sized so that
+        // out_off + 16 <= out.len() whenever in_off + 20 <= input.len().
+        let neon_ok =
+            unsafe { try_decode_block_x4(&input[in_off..], &mut out[out_off..]) }.is_ok();
+        if neon_ok {
+            in_off += 20;
+            out_off += 16;
+        } else {
+            for _ in 0..4 {
+                let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
+                let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
+                decode_block(block, chunk, in_off)?;
+                in_off += 5;
+                out_off += 4;
+            }
+        }
+    }
+
+    while in_off + 5 <= input.len() {
+        let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
+        let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
+        decode_block(block, chunk, in_off)?;
+        in_off += 5;
+        out_off += 4;
+    }
+
+    let tail = &input[in_off..];
+    if !tail.is_empty() {
+        decode_tail(tail, &mut out[out_off..out_off + tail.len() - 1], in_off)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     let mut in_off = 0;
     let mut out_off = 0;
@@ -226,6 +272,56 @@ mod tests {
             let decoded = decode(&encoded).unwrap();
             assert_eq!(decoded, input, "round-trip mismatch len={n}");
         }
+    }
+
+    #[test]
+    fn round_trip_long_inputs() {
+        // Exercises both the NEON decode chunk path (20+ chars) and the
+        // scalar tail. 1024 bytes → 1280 chars = 64 NEON chunks.
+        for n in [20usize, 80, 256, 1024, 4096] {
+            let input: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(31)) as u8).collect();
+            let encoded = encode(&input);
+            assert_eq!(encoded, base85::encode(&input), "encode mismatch len={n}");
+            let decoded = decode(&encoded).unwrap();
+            assert_eq!(decoded, input, "round-trip mismatch len={n}");
+        }
+    }
+
+    #[test]
+    fn decode_matches_reference_for_long_input() {
+        // Reference encodes, we decode — verifies our NEON decode against
+        // an independent implementation, not just our own encode.
+        let input: Vec<u8> = (0..1024u32).map(|i| (i * 17) as u8).collect();
+        let encoded_by_ref = base85::encode(&input);
+        let decoded_by_us = decode(&encoded_by_ref).unwrap();
+        assert_eq!(decoded_by_us, input);
+    }
+
+    #[test]
+    fn decode_invalid_char_in_neon_chunk() {
+        // Inject an invalid char inside what would be the second NEON
+        // chunk so the fallback path has to kick in mid-stream.
+        let input: Vec<u8> = (0..40).map(|i| i as u8).collect();
+        let mut encoded = encode(&input).into_bytes();
+        encoded[25] = b' '; // position 25 is inside the 2nd 20-char chunk
+        let s = std::str::from_utf8(&encoded).unwrap();
+        let err = decode(s).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::InvalidChar { byte: b' ', position: 25 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_overflow_is_caught() {
+        // "|NsC1" decodes to u32::MAX + 1 (since "|NsC0" encodes u32::MAX).
+        // Pad with a valid block to land in the NEON path.
+        let mut s = String::from("00000"); // valid leading block (0u32)
+        s.push_str("|NsC1"); // overflowing block
+        s.push_str("00000"); // valid trailing block
+        s.push_str("00000"); // 4 blocks total → exactly one NEON chunk
+        let err = decode(&s).unwrap_err();
+        assert!(matches!(err, DecodeError::Overflow { .. }), "got {err:?}");
     }
 
     #[test]

@@ -33,8 +33,10 @@ for decoding.
 ## Status
 
 - Public API: `encode(&[u8]) -> String`, `decode(&str) -> Result<Vec<u8>, DecodeError>`.
-- Encode: NEON-accelerated on `aarch64`, scalar elsewhere.
-- Decode: scalar (a NEON decode is planned but not yet shipped).
+- Encode and decode are both NEON-accelerated on `aarch64`, scalar elsewhere.
+- The decode path validates char range and detects `u32` overflow lane-wise;
+  any invalid input falls back to the scalar path so the resulting
+  `DecodeError` carries a precise byte position.
 - Tested against the `base85` reference crate via quickcheck round-trip and
   parity checks.
 
@@ -46,12 +48,12 @@ Run with:
 cargo bench --bench encode
 ```
 
-Sample results (Apple M-series, 1 KB input, encode):
+Sample results (Apple M-series, 1 KB input):
 
-| Implementation | Time   |
-|----------------|--------|
-| `base85`       | 361 ns |
-| `base85-simd`  | 236 ns |
+| Operation | `base85` | `base85-simd` | speedup |
+|-----------|----------|---------------|---------|
+| encode    | 361 ns   | 236 ns        | 1.5×    |
+| decode    | 2.33 µs  | 230 ns        | 10×     |
 
 ## License
 

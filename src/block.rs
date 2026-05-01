@@ -514,6 +514,124 @@ mod neon {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// SSE encoder / decoder (x86_64)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// SSSE3 is required for `_mm_shuffle_epi8` (the equivalent of NEON's
+// `vqtbl1q_u8`); SSE4.1 is required for `_mm_mullo_epi32` (lane-wise
+// u32 multiply). Both are universal on x86_64 silicon since ~2008. We
+// depend on them being present at compile time via the default
+// `target-feature` set on `x86_64-*-*` (which includes SSSE3 and
+// SSE4.1 for all modern targets including `x86_64-unknown-linux-gnu`
+// and `x86_64-apple-darwin`).
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) use sse::{SseEncoder, try_decode_block_x4};
+
+#[cfg(target_arch = "x86_64")]
+mod sse {
+    #![allow(clippy::indexing_slicing)]
+    // The `unwrap`s in the stub bodies are over `&[u8; 16]` / `&[u8; 20]`
+    // sub-array conversions whose lengths are statically known. Once the
+    // bodies are replaced with intrinsics, this allow can probably go.
+    #![allow(clippy::unwrap_used)]
+    #![allow(dead_code)] // scaffold — bodies will use these once intrinsics are written.
+
+    use crate::ops::{div_85, div_85_cube, div_85_sq};
+    use std::arch::x86_64::__m128i;
+
+    /// SSSE3/SSE4.1 4-block encoder. Mirrors [`super::neon::NeonEncoder`].
+    ///
+    /// Constructor is a no-op; per-call splice indexes live in static
+    /// arrays loaded via `_mm_loadu_si128`.
+    pub(crate) struct SseEncoder;
+
+    impl SseEncoder {
+        #[inline]
+        pub(crate) fn new() -> Self {
+            Self
+        }
+
+        /// Encode exactly 16 input bytes into exactly 20 output bytes.
+        ///
+        /// **Stub.** This currently delegates to the scalar
+        /// [`super::encode_block`] for each of the 4 sub-blocks, so the
+        /// path is correct but unaccelerated. Replace the body with the
+        /// SSE intrinsic chain to get the speed-up:
+        ///
+        /// 1. Load 16 bytes via `_mm_loadu_si128` and byte-swap each
+        ///    u32 lane via `_mm_shuffle_epi8` with a constant index
+        ///    `[3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12]`.
+        /// 2. Compute `q1 = n / 85`, `q2 = n / 85²`, `q3 = n / 85³`,
+        ///    `q4 = q2 / 85²` using [`div_85`] / [`div_85_sq`] /
+        ///    [`div_85_cube`] (already wired up — see [`crate::ops`]).
+        /// 3. Compute the 5 digits via lane-wise multiply-subtract
+        ///    (`_mm_sub_epi32(q_k_minus_1, _mm_mullo_epi32(q_k, splat85))`).
+        /// 4. Splice digits into out_1 (16 bytes) + out_2 (4 bytes)
+        ///    via `_mm_shuffle_epi8` with a chain of OR-blends.
+        /// 5. Convert digits 0..84 to ASCII via `_mm_shuffle_epi8`
+        ///    against a precomputed alphabet table (the table is too
+        ///    large for a single `pshufb`, so split at 64 like the
+        ///    NEON path).
+        /// 6. Store via `_mm_storeu_si128` + a 4-byte tail store.
+        #[inline]
+        pub(crate) fn encode_block_x4(&self, in_bytes: &[u8; 16], out_bytes: &mut [u8; 20]) {
+            // SAFETY: in_bytes is a 16-byte array; sub-arrays at the
+            // 4-byte boundaries are in-bounds.
+            for i in 0..4 {
+                let src: &[u8; 4] = (&in_bytes[i * 4..i * 4 + 4]).try_into().unwrap();
+                let dst: &mut [u8; 5] = (&mut out_bytes[i * 5..i * 5 + 5]).try_into().unwrap();
+                super::encode_block(src, dst);
+            }
+            // Suppress unused-import warnings while these are not yet wired
+            // through the SIMD path.
+            let _: fn(__m128i) -> __m128i = div_85;
+            let _: fn(__m128i) -> __m128i = div_85_sq;
+            let _: fn(__m128i) -> __m128i = div_85_cube;
+        }
+    }
+
+    /// SSSE3 decode of 20 input chars → 16 output bytes.
+    ///
+    /// **Stub.** Currently delegates to scalar [`super::decode_block`]
+    /// for each of the 4 sub-blocks, returning `Err(())` on the first
+    /// invalid char or u32 overflow so the loop in
+    /// [`crate::decode_into`] falls back to scalar (which surfaces
+    /// the precise [`crate::DecodeError`] with the right byte
+    /// position).
+    ///
+    /// Sketch of the SIMD body:
+    ///
+    /// 1. `_mm_loadu_si128` for chars 0..16 and a partial load for
+    ///    chars 16..19 (zero-padded).
+    /// 2. Range-validate `[33, 126]` via two `_mm_cmpgt_epi8` masks
+    ///    and `_mm_or_si128`.
+    /// 3. ASCII → digit via two `_mm_shuffle_epi8` table lookups
+    ///    (low half + high half of the alphabet) with a `_mm_blendv_epi8`
+    ///    selector keyed on `chars < 97`.
+    /// 4. Detect 0xFF results (in-alphabet gaps) via `_mm_cmpeq_epi8`.
+    /// 5. Permute digits into per-position `__m128i` vectors `v_d0..v_d4`
+    ///    via `_mm_shuffle_epi8` over a paired source.
+    /// 6. Horner-style `vmlaq_n_u32` chain becomes `_mm_mullo_epi32` +
+    ///    `_mm_add_epi32`.
+    /// 7. Overflow check: `n_wrap < d0 * 85⁴` lane-wise via
+    ///    `_mm_cmplt_epi32` (for unsigned this needs the bias trick).
+    /// 8. Byte-swap each u32 lane back to BE via `_mm_shuffle_epi8`,
+    ///    then `_mm_storeu_si128`.
+    #[inline]
+    pub(crate) fn try_decode_block_x4(input: &[u8; 20], out: &mut [u8; 16]) -> Result<(), ()> {
+        for i in 0..4 {
+            let src: &[u8; 5] = (&input[i * 5..i * 5 + 5]).try_into().unwrap();
+            let dst: &mut [u8; 4] = (&mut out[i * 4..i * 4 + 4]).try_into().unwrap();
+            // base_position 0 because the caller (`decode_into`) replays
+            // the chunk scalar on Err and handles position reporting itself.
+            super::decode_block(src, dst, 0).map_err(|_| ())?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

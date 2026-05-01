@@ -252,10 +252,7 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
         // out.len()` are checked in the loop guard, so the open-slice
         // arguments below carry the size invariants `try_decode_block_x4`
         // requires (≥20 readable / ≥16 writable bytes).
-        let neon_ok = unsafe {
-            try_decode_block_x4(&input[in_off..], &mut out[out_off..])
-        }
-        .is_ok();
+        let neon_ok = unsafe { try_decode_block_x4(&input[in_off..], &mut out[out_off..]) }.is_ok();
 
         if neon_ok {
             in_off += 20;
@@ -263,8 +260,7 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
         } else {
             for _ in 0..4 {
                 let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
-                let chunk: &mut [u8; 4] =
-                    (&mut out[out_off..out_off + 4]).try_into().unwrap();
+                let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
                 decode_block(block, chunk, in_off)?;
                 in_off += 5;
                 out_off += 4;
@@ -326,7 +322,12 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use quickcheck::{Gen, QuickCheck, quickcheck};
@@ -361,7 +362,9 @@ mod tests {
     #[test]
     fn round_trip_every_length_up_to_256() {
         for n in 0..=256usize {
-            let input: Vec<u8> = (0..n).map(|i| (i as u8).wrapping_mul(7).wrapping_add(11)).collect();
+            let input: Vec<u8> = (0..n)
+                .map(|i| (i as u8).wrapping_mul(7).wrapping_add(11))
+                .collect();
             let encoded = encode(&input);
             assert_eq!(encoded, base85::encode(&input), "encode mismatch len={n}");
             let decoded = decode(&encoded).unwrap();
@@ -374,7 +377,9 @@ mod tests {
     #[test]
     fn round_trip_chunk_boundary_lengths() {
         let mut sizes: Vec<usize> = Vec::new();
-        for base in [0usize, 4, 8, 12, 16, 20, 32, 64, 96, 128, 192, 256, 1024, 4096] {
+        for base in [
+            0usize, 4, 8, 12, 16, 20, 32, 64, 96, 128, 192, 256, 1024, 4096,
+        ] {
             for delta in [0i32, -1, 1, -2, 2, -3, 3] {
                 let n = base as i32 + delta;
                 if n >= 0 {
@@ -503,7 +508,10 @@ mod tests {
         let err = decode("00 00").unwrap_err();
         assert!(matches!(
             err,
-            DecodeError::InvalidChar { byte: b' ', position: 2 }
+            DecodeError::InvalidChar {
+                byte: b' ',
+                position: 2
+            }
         ));
     }
 

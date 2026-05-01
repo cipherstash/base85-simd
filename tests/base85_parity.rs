@@ -156,7 +156,10 @@ fn cross_decode_our_encode_their_decode() {
         let input: Vec<u8> = (0..len).map(|i| (i as u8) ^ 0x3C).collect();
         let our_encoded = base85_simd::encode(&input);
         let their_decoded = base85::decode(&our_encoded).expect("ref must accept our output");
-        assert_eq!(their_decoded, input, "round-trip via ref decode at len {len}");
+        assert_eq!(
+            their_decoded, input,
+            "round-trip via ref decode at len {len}"
+        );
     }
 }
 
@@ -240,8 +243,8 @@ fn invalid_inputs_we_reject_overflow_ref_undefined() {
 #[test]
 fn both_reject_invalid_char_inputs() {
     let invalid_inputs = [
-        "00 00", "0\"000", "00,00", "00.00", "00:00", "0[000", "0\\000", "0]000",
-        "abcd ", "abcd\t", "abcd\n", " abcd",
+        "00 00", "0\"000", "00,00", "00.00", "00:00", "0[000", "0\\000", "0]000", "abcd ",
+        "abcd\t", "abcd\n", " abcd",
     ];
     for s in invalid_inputs {
         let ours = base85_simd::decode(s);

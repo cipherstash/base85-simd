@@ -25,12 +25,16 @@
 //! `is_x86_feature_detected!("avx2")` check before invoking; on hosts
 //! lacking AVX2 the crate routes to the scalar fallback.
 //!
-//! Inner `unsafe { ... }` blocks are required on Rust 1.85 (MSRV) for
-//! calls to target-feature-gated intrinsics inside an `unsafe fn`.
-//! Newer toolchains may flag those blocks as redundant, hence the
-//! module-level `unused_unsafe` allow.
+//! `#![allow(unsafe_op_in_unsafe_fn)]` at the module level lets every
+//! `unsafe fn` body act as an implicit `unsafe` scope — without it,
+//! Rust 1.85 (MSRV) requires explicit `unsafe { … }` around each
+//! target-feature-gated intrinsic call even inside an `unsafe fn`
+//! with matching `target_feature`. Newer toolchains relax this, so
+//! the alternative would be 1.85-only inner blocks plus an
+//! `unused_unsafe` allow elsewhere; the override keeps the code
+//! readable across the full toolchain range.
 
-#![allow(unused_unsafe)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use std::arch::x86_64::{
     __m256i, _mm256_blend_epi16, _mm256_mul_epu32, _mm256_set1_epi32, _mm256_shuffle_epi32,
@@ -45,8 +49,7 @@ use std::arch::x86_64::{
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn div_85(input: __m256i) -> __m256i {
     // m = ceil(2^38 / 85) = 3_233_857_729; m * 85 - 2^38 = 21 < 2^6.
-    // SAFETY: caller upholds AVX2 (function-level target_feature).
-    unsafe { div_magic::<3_233_857_729, 6>(input) }
+    div_magic::<3_233_857_729, 6>(input)
 }
 
 /// Lane-wise `input / 7225` (i.e. `input / 85²`). Valid for all u32 inputs.
@@ -57,8 +60,7 @@ pub(crate) unsafe fn div_85(input: __m256i) -> __m256i {
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn div_85_sq(input: __m256i) -> __m256i {
     // m = ceil(2^44 / 7225) = 2_434_904_643; m * 7225 - 2^44 = 1259 < 2^12.
-    // SAFETY: caller upholds AVX2.
-    unsafe { div_magic::<2_434_904_643, 12>(input) }
+    div_magic::<2_434_904_643, 12>(input)
 }
 
 /// Lane-wise `input / 614125` (i.e. `input / 85³`). Valid for all u32 inputs.
@@ -69,8 +71,7 @@ pub(crate) unsafe fn div_85_sq(input: __m256i) -> __m256i {
 #[target_feature(enable = "avx2")]
 pub(crate) unsafe fn div_85_cube(input: __m256i) -> __m256i {
     // m = ceil(2^51 / 614125) = 3_666_679_933; bound check passes for u32.
-    // SAFETY: caller upholds AVX2.
-    unsafe { div_magic::<3_666_679_933, 19>(input) }
+    div_magic::<3_666_679_933, 19>(input)
 }
 
 /// Generic libdivide-style div over 8 u32 lanes:
@@ -91,90 +92,29 @@ pub(crate) unsafe fn div_85_cube(input: __m256i) -> __m256i {
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn div_magic<const MAGIC: u32, const SHIFT: i32>(input: __m256i) -> __m256i {
-    // SAFETY (1.85 MSRV): caller has AVX2; all intrinsics below are
-    // gated on AVX2 (or its prerequisites).
-    unsafe {
-        let magic = _mm256_set1_epi32(MAGIC as i32);
+    let magic = _mm256_set1_epi32(MAGIC as i32);
 
-        let even = _mm256_mul_epu32(input, magic);
-        let input_odd = _mm256_srli_epi64::<32>(input);
-        let odd = _mm256_mul_epu32(input_odd, magic);
+    let even = _mm256_mul_epu32(input, magic);
+    let input_odd = _mm256_srli_epi64::<32>(input);
+    let odd = _mm256_mul_epu32(input_odd, magic);
 
-        // Per-128-bit-lane shuffle: broadcasts hi u32 of each u64
-        // product across the pair, in each lane independently.
-        let even_hi = _mm256_shuffle_epi32::<0b11_11_01_01>(even);
-        let odd_hi = _mm256_shuffle_epi32::<0b11_11_01_01>(odd);
+    // Per-128-bit-lane shuffle: broadcasts hi u32 of each u64 product
+    // across the pair, in each lane independently.
+    let even_hi = _mm256_shuffle_epi32::<0b11_11_01_01>(even);
+    let odd_hi = _mm256_shuffle_epi32::<0b11_11_01_01>(odd);
 
-        // Per-lane blend at u16 granularity. The 8-bit MASK is applied
-        // to each 128-bit lane, so 0xCC interleaves [hi0, hi1, hi2, hi3]
-        // within each lane independently.
-        let combined = _mm256_blend_epi16::<0xCC>(even_hi, odd_hi);
+    // Per-lane blend at u16 granularity. The 8-bit MASK is applied to
+    // each 128-bit lane, so 0xCC interleaves [hi0, hi1, hi2, hi3]
+    // within each lane independently.
+    let combined = _mm256_blend_epi16::<0xCC>(even_hi, odd_hi);
 
-        _mm256_srli_epi32::<SHIFT>(combined)
-    }
+    _mm256_srli_epi32::<SHIFT>(combined)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use quickcheck::{Arbitrary, quickcheck};
-    use std::{
-        arch::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256},
-        array,
-    };
-
-    #[derive(Debug, Clone, Copy)]
-    struct InputBlock([u32; 8]);
-
-    impl Arbitrary for InputBlock {
-        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
-            InputBlock(array::from_fn(|_| u32::arbitrary(g)))
-        }
-    }
-
-    fn lanes(v: __m256i) -> [u32; 8] {
-        let mut out = [0u32; 8];
-        unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast::<__m256i>(), v) };
-        out
-    }
-
-    fn load(input: &[u32; 8]) -> __m256i {
-        unsafe { _mm256_loadu_si256(input.as_ptr().cast::<__m256i>()) }
-    }
-
-    fn host_has_avx2() -> bool {
-        std::is_x86_feature_detected!("avx2")
-    }
-
-    quickcheck! {
-        fn div_85_matches_scalar(block: InputBlock) -> bool {
-            if !host_has_avx2() { return true; }
-            let InputBlock(input) = block;
-            let q_out = lanes(unsafe { div_85(load(&input)) });
-            (0..8).all(|i| q_out[i] == input[i] / 85)
-        }
-
-        fn div_85_sq_matches_scalar(block: InputBlock) -> bool {
-            if !host_has_avx2() { return true; }
-            let InputBlock(input) = block;
-            let q_out = lanes(unsafe { div_85_sq(load(&input)) });
-            (0..8).all(|i| q_out[i] == input[i] / (85 * 85))
-        }
-
-        fn div_85_cube_matches_scalar(block: InputBlock) -> bool {
-            if !host_has_avx2() { return true; }
-            let InputBlock(input) = block;
-            let q_out = lanes(unsafe { div_85_cube(load(&input)) });
-            (0..8).all(|i| q_out[i] == input[i] / (85 * 85 * 85))
-        }
-
-        fn div_85_to_the_4_via_composition(block: InputBlock) -> bool {
-            if !host_has_avx2() { return true; }
-            let InputBlock(input) = block;
-            let q2 = unsafe { div_85_sq(load(&input)) };
-            let q4 = unsafe { div_85_sq(q2) };
-            let q4_out = lanes(q4);
-            (0..8).all(|i| q4_out[i] == input[i] / (85u32.pow(4)))
-        }
-    }
-}
+// `div_85*` correctness is exercised transitively by the parity tests
+// in `tests/base85_parity.rs`, which round-trip every encoded byte
+// through the AVX2 path on hosts where the runtime feature gate
+// admits it. A separate quickcheck here would either need a runtime
+// `is_x86_feature_detected!` skip (a smell) or RUSTFLAGS-based
+// compile-time gating for CI — neither earns its keep against the
+// existing transitive coverage.

@@ -206,7 +206,7 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
     // back to the scalar path otherwise. The branch predicts
     // perfectly across calls so the cost is negligible.
     if !std::is_x86_feature_detected!("avx2") {
-        encode_into_scalar(input, out);
+        encode_scalar(input, out);
         return;
     }
 
@@ -252,39 +252,16 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
     }
 }
 
-/// Pure-scalar fallback used by the x86 path on CPUs lacking AVX2
-/// (rare on x86 server hardware after ~2013, but possible).
-#[cfg(target_arch = "x86_64")]
-fn encode_into_scalar(input: &[u8], out: &mut [u8]) {
-    let mut in_off = 0usize;
-    let mut out_off = 0usize;
-
-    while in_off.saturating_add(4) <= input.len() {
-        let Some(block) = chunk_at::<4>(input, in_off) else {
-            return;
-        };
-        let Some(chunk) = chunk_at_mut::<5>(out, out_off) else {
-            return;
-        };
-        encode_block(block, chunk);
-        in_off = in_off.saturating_add(4);
-        out_off = out_off.saturating_add(5);
-    }
-
-    let tail_in_len = input.len().saturating_sub(in_off);
-    if tail_in_len > 0 {
-        let tail_out_len = tail_in_len.saturating_add(1);
-        if let (Some(tail_in), Some(tail_out)) = (
-            input.get(in_off..in_off.saturating_add(tail_in_len)),
-            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
-        ) {
-            encode_tail(tail_in, tail_out);
-        }
-    }
-}
-
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 fn encode_into(input: &[u8], out: &mut [u8]) {
+    encode_scalar(input, out);
+}
+
+/// Pure-scalar encode loop. Used by the x86 path on CPUs lacking AVX2
+/// (rare on x86 server hardware after ~2013, but possible) and as the
+/// only encoder on non-aarch64, non-x86_64 targets.
+#[cfg(not(target_arch = "aarch64"))]
+fn encode_scalar(input: &[u8], out: &mut [u8]) {
     let mut in_off = 0usize;
     let mut out_off = 0usize;
 
@@ -389,7 +366,7 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     // Runtime feature gate: AVX2 needed for the fast path; otherwise
     // route to scalar fallback.
     if !std::is_x86_feature_detected!("avx2") {
-        return decode_into_scalar(input, out);
+        return decode_scalar(input, out);
     }
 
     let mut in_off = 0usize;
@@ -444,40 +421,15 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     Ok(())
 }
 
-/// Pure-scalar fallback used by the x86 decode path on CPUs lacking AVX2.
-#[cfg(target_arch = "x86_64")]
-fn decode_into_scalar(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
-    let mut in_off = 0usize;
-    let mut out_off = 0usize;
-
-    while in_off.saturating_add(5) <= input.len() {
-        let Some(block) = chunk_at::<5>(input, in_off) else {
-            return Ok(());
-        };
-        let Some(chunk) = chunk_at_mut::<4>(out, out_off) else {
-            return Ok(());
-        };
-        decode_block(block, chunk, in_off)?;
-        in_off = in_off.saturating_add(5);
-        out_off = out_off.saturating_add(4);
-    }
-
-    let tail_in_len = input.len().saturating_sub(in_off);
-    if tail_in_len > 0 {
-        let tail_out_len = tail_in_len.saturating_sub(1);
-        if let (Some(tail_in), Some(tail_out)) = (
-            input.get(in_off..in_off.saturating_add(tail_in_len)),
-            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
-        ) {
-            decode_tail(tail_in, tail_out, in_off)?;
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
+    decode_scalar(input, out)
+}
+
+/// Pure-scalar decode loop. Used by the x86 path on CPUs lacking AVX2
+/// and as the only decoder on non-aarch64, non-x86_64 targets.
+#[cfg(not(target_arch = "aarch64"))]
+fn decode_scalar(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     let mut in_off = 0usize;
     let mut out_off = 0usize;
 

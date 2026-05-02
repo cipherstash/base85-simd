@@ -3,13 +3,22 @@ name = "base85-simd"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Fast base85 (RFC 1924 / Z85-style) encoder and decoder, with a NEON SIMD encode path on aarch64."
+description = "Fast base85 (RFC 1924 / Z85-style) encoder and decoder, with SIMD on aarch64 (NEON) and x86_64 (AVX2)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/cipherstash/base85-simd"
+homepage = "https://github.com/cipherstash/base85-simd"
 readme = "README.md"
 keywords = ["base85", "ascii85", "simd", "neon", "encoding"]
 categories = ["encoding"]
 exclude = ["*.xlsx", ".DS_Store", "mise.toml"]
+
+[package.metadata.docs.rs]
+# Build docs for both SIMD targets so the per-arch entry points
+# (NeonEncoder / Avx2Encoder, etc.) all render. docs.rs's default
+# x86_64-unknown-linux-gnu picks up the AVX2 path; we add aarch64
+# so the NEON path is also documented in the rendered output.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 

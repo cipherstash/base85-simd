@@ -198,33 +198,34 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
 
 #[cfg(target_arch = "x86_64")]
 fn encode_into(input: &[u8], out: &mut [u8]) {
-    use block::SseEncoder;
+    use block::Avx2Encoder;
 
-    // Runtime feature gate: the SSE intrinsics carry
-    // `#[target_feature(enable = "sse4.1,ssse3")]`, so calling them on
-    // a CPU without those features is UB. Detect once at the entry
-    // point and route to the scalar fallback otherwise. This branch
-    // predicts perfectly so the cost is negligible.
-    if !(std::is_x86_feature_detected!("sse4.1") && std::is_x86_feature_detected!("ssse3")) {
+    // Runtime feature gate: the AVX2 intrinsics are gated on
+    // `#[target_feature(enable = "avx2")]`; calling them on a CPU
+    // lacking AVX2 is UB. Detect once at the entry point and fall
+    // back to the scalar path otherwise. The branch predicts
+    // perfectly across calls so the cost is negligible.
+    if !std::is_x86_feature_detected!("avx2") {
         encode_into_scalar(input, out);
         return;
     }
 
-    let encoder = SseEncoder::new();
+    let encoder = Avx2Encoder::new();
     let mut in_off = 0usize;
     let mut out_off = 0usize;
 
-    while in_off.saturating_add(16) <= input.len() {
-        let Some(in_chunk) = chunk_at::<16>(input, in_off) else {
+    // 32 → 40 byte AVX2 chunks (8 blocks per iteration).
+    while in_off.saturating_add(32) <= input.len() {
+        let Some(in_chunk) = chunk_at::<32>(input, in_off) else {
             return;
         };
-        let Some(out_chunk) = chunk_at_mut::<20>(out, out_off) else {
+        let Some(out_chunk) = chunk_at_mut::<40>(out, out_off) else {
             return;
         };
-        // SAFETY: we verified SSE4.1 + SSSE3 above.
-        unsafe { encoder.encode_block_x4(in_chunk, out_chunk) };
-        in_off = in_off.saturating_add(16);
-        out_off = out_off.saturating_add(20);
+        // SAFETY: AVX2 verified above.
+        unsafe { encoder.encode_block_x8(in_chunk, out_chunk) };
+        in_off = in_off.saturating_add(32);
+        out_off = out_off.saturating_add(40);
     }
 
     while in_off.saturating_add(4) <= input.len() {
@@ -251,8 +252,8 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
     }
 }
 
-/// Pure-scalar fallback used by the x86 path on CPUs lacking
-/// SSE4.1 + SSSE3 (e.g. very old Pentium 4-class hardware).
+/// Pure-scalar fallback used by the x86 path on CPUs lacking AVX2
+/// (rare on x86 server hardware after ~2013, but possible).
 #[cfg(target_arch = "x86_64")]
 fn encode_into_scalar(input: &[u8], out: &mut [u8]) {
     let mut in_off = 0usize;
@@ -383,33 +384,35 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     reason = "infallible / in-bounds by loop-condition invariant; see SAFETY comment"
 )]
 fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
-    use block::try_decode_block_x4;
+    use block::try_decode_block_x8;
 
-    // Runtime feature gate: the SSE intrinsics are gated on
-    // `target_feature(enable = "sse4.1,ssse3")`; calling them on a CPU
-    // lacking those features is UB. Detect once at the entry point.
-    if !(std::is_x86_feature_detected!("sse4.1") && std::is_x86_feature_detected!("ssse3")) {
+    // Runtime feature gate: AVX2 needed for the fast path; otherwise
+    // route to scalar fallback.
+    if !std::is_x86_feature_detected!("avx2") {
         return decode_into_scalar(input, out);
     }
 
     let mut in_off = 0usize;
     let mut out_off = 0usize;
 
-    while in_off + 20 <= input.len() && out_off + 16 <= out.len() {
-        let Some(in_chunk) = chunk_at::<20>(input, in_off) else {
+    // 40-char (8-block) AVX2 chunks. On per-chunk failure (invalid
+    // char or u32 overflow), replay the same chunk scalar so the
+    // resulting DecodeError carries the precise failing byte position.
+    while in_off + 40 <= input.len() && out_off + 32 <= out.len() {
+        let Some(in_chunk) = chunk_at::<40>(input, in_off) else {
             return Ok(());
         };
-        let Some(out_chunk) = chunk_at_mut::<16>(out, out_off) else {
+        let Some(out_chunk) = chunk_at_mut::<32>(out, out_off) else {
             return Ok(());
         };
 
-        // SAFETY: SSE4.1 + SSSE3 verified above.
-        let sse_ok = unsafe { try_decode_block_x4(in_chunk, out_chunk) }.is_ok();
-        if sse_ok {
-            in_off += 20;
-            out_off += 16;
+        // SAFETY: AVX2 verified above.
+        let avx_ok = unsafe { try_decode_block_x8(in_chunk, out_chunk) }.is_ok();
+        if avx_ok {
+            in_off += 40;
+            out_off += 32;
         } else {
-            for _ in 0..4 {
+            for _ in 0..8 {
                 let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
                 let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
                 decode_block(block, chunk, in_off)?;
@@ -441,8 +444,7 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     Ok(())
 }
 
-/// Pure-scalar fallback used by the x86 decode path on CPUs lacking
-/// SSE4.1 + SSSE3.
+/// Pure-scalar fallback used by the x86 decode path on CPUs lacking AVX2.
 #[cfg(target_arch = "x86_64")]
 fn decode_into_scalar(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     let mut in_off = 0usize;

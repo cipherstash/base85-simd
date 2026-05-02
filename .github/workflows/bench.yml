@@ -42,6 +42,28 @@ jobs:
             | sort -u | tr '\n' ' '
           echo
 
+      # Guard: the bench numbers from this workflow are the only x86 perf
+      # data we have until we get dedicated metal. If GitHub ever rotates
+      # the runner fleet to hardware without SSE4.1/SSSE3/AVX2 (extremely
+      # unlikely — those have been universal x86 server features since
+      # ~2013), the SIMD path would silently fall back to scalar inside
+      # the crate's runtime feature gate and the comparison would
+      # become apples-to-apples scalar vs scalar. Fail loudly instead.
+      - name: Require SSE4.1 + SSSE3 + AVX2
+        run: |
+          missing=()
+          for feat in sse4_1 ssse3 avx2; do
+            if ! grep -q "\b${feat}\b" /proc/cpuinfo; then
+              missing+=("${feat}")
+            fi
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Required CPU features missing on this runner: ${missing[*]}."
+            echo "::error::Bench would silently fall back to scalar; aborting."
+            exit 1
+          fi
+          echo "All required features present."
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 

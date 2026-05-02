@@ -1,0 +1,29 @@
+# Changelog
+
+All notable changes to this crate are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0] - 2026-05-02
+
+Initial release.
+
+- `encode(&[u8]) -> String` and `decode(&str) -> Result<Vec<u8>, DecodeError>`,
+  byte-for-byte compatible with the `base85` crate v2.0.0 on the success path.
+- aarch64 NEON-accelerated encode (4 blocks/iter) and decode (4 blocks/iter,
+  ~10× the reference scalar throughput on Apple M-series).
+- x86_64 AVX2-accelerated encode and decode (8 blocks/iter), with runtime
+  feature detection and scalar fallback for hosts lacking AVX2.
+- Portable scalar implementation for other architectures.
+- Strict overflow detection: 5-character blocks whose value exceeds `u32::MAX`
+  return `DecodeError::Overflow` rather than silently wrapping (release) or
+  panicking (debug) as the reference does.
+- Diagnostic `DecodeError` enum with byte positions; marked `#[non_exhaustive]`
+  for forward-compatibility.
+- MSRV: Rust 1.85.
+
+[Unreleased]: https://github.com/cipherstash/base85-simd/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/cipherstash/base85-simd/releases/tag/v0.1.0

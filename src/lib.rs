@@ -18,7 +18,11 @@ use block::{decode_block, decode_tail, encode_block, encode_tail};
 use std::fmt;
 
 /// Errors returned by [`decode`].
+///
+/// Marked `#[non_exhaustive]` — match arms must include `_ => …` so future
+/// additions don't break downstream code.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeError {
     /// The input contained a byte that is not part of the base85 alphabet.
     InvalidChar {

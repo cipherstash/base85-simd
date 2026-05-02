@@ -3,6 +3,7 @@ name = "base85-simd"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+authors = ["Dan Draper <dan@cipherstash.com>"]
 description = "Fast base85 (RFC 1924 / Z85-style) encoder and decoder, with SIMD on aarch64 (NEON) and x86_64 (AVX2)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/cipherstash/base85-simd"

@@ -196,8 +196,69 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 fn encode_into(input: &[u8], out: &mut [u8]) {
+    use block::Avx2Encoder;
+
+    // Runtime feature gate: the AVX2 intrinsics are gated on
+    // `#[target_feature(enable = "avx2")]`; calling them on a CPU
+    // lacking AVX2 is UB. Detect once at the entry point and fall
+    // back to the scalar path otherwise. The branch predicts
+    // perfectly across calls so the cost is negligible.
+    if !std::is_x86_feature_detected!("avx2") {
+        encode_scalar(input, out);
+        return;
+    }
+
+    let encoder = Avx2Encoder::new();
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
+
+    // 32 → 40 byte AVX2 chunks (8 blocks per iteration).
+    while in_off.saturating_add(32) <= input.len() {
+        let Some(in_chunk) = chunk_at::<32>(input, in_off) else {
+            return;
+        };
+        let Some(out_chunk) = chunk_at_mut::<40>(out, out_off) else {
+            return;
+        };
+        // SAFETY: AVX2 verified above.
+        unsafe { encoder.encode_block_x8(in_chunk, out_chunk) };
+        in_off = in_off.saturating_add(32);
+        out_off = out_off.saturating_add(40);
+    }
+
+    while in_off.saturating_add(4) <= input.len() {
+        let Some(block) = chunk_at::<4>(input, in_off) else {
+            return;
+        };
+        let Some(chunk) = chunk_at_mut::<5>(out, out_off) else {
+            return;
+        };
+        encode_block(block, chunk);
+        in_off = in_off.saturating_add(4);
+        out_off = out_off.saturating_add(5);
+    }
+
+    let tail_in_len = input.len().saturating_sub(in_off);
+    if tail_in_len > 0 {
+        let tail_out_len = tail_in_len.saturating_add(1);
+        if let (Some(tail_in), Some(tail_out)) = (
+            input.get(in_off..in_off.saturating_add(tail_in_len)),
+            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
+        ) {
+            encode_tail(tail_in, tail_out);
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn encode_into(input: &[u8], out: &mut [u8]) {
+    encode_scalar(input, out);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn encode_scalar(input: &[u8], out: &mut [u8]) {
     let mut in_off = 0usize;
     let mut out_off = 0usize;
 
@@ -290,8 +351,80 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     Ok(())
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "infallible / in-bounds by loop-condition invariant; see SAFETY comment"
+)]
 fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
+    use block::try_decode_block_x8;
+
+    // Runtime feature gate: AVX2 needed for the fast path; otherwise
+    // route to scalar fallback.
+    if !std::is_x86_feature_detected!("avx2") {
+        return decode_scalar(input, out);
+    }
+
+    let mut in_off = 0usize;
+    let mut out_off = 0usize;
+
+    // 40-char (8-block) AVX2 chunks. On per-chunk failure (invalid
+    // char or u32 overflow), replay the same chunk scalar so the
+    // resulting DecodeError carries the precise failing byte position.
+    while in_off + 40 <= input.len() && out_off + 32 <= out.len() {
+        let Some(in_chunk) = chunk_at::<40>(input, in_off) else {
+            return Ok(());
+        };
+        let Some(out_chunk) = chunk_at_mut::<32>(out, out_off) else {
+            return Ok(());
+        };
+
+        // SAFETY: AVX2 verified above.
+        let avx_ok = unsafe { try_decode_block_x8(in_chunk, out_chunk) }.is_ok();
+        if avx_ok {
+            in_off += 40;
+            out_off += 32;
+        } else {
+            for _ in 0..8 {
+                let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
+                let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
+                decode_block(block, chunk, in_off)?;
+                in_off += 5;
+                out_off += 4;
+            }
+        }
+    }
+
+    while in_off + 5 <= input.len() && out_off + 4 <= out.len() {
+        let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
+        let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
+        decode_block(block, chunk, in_off)?;
+        in_off += 5;
+        out_off += 4;
+    }
+
+    let tail_in_len = input.len().saturating_sub(in_off);
+    if tail_in_len > 0 {
+        let tail_out_len = tail_in_len.saturating_sub(1);
+        if let (Some(tail_in), Some(tail_out)) = (
+            input.get(in_off..in_off.saturating_add(tail_in_len)),
+            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
+        ) {
+            decode_tail(tail_in, tail_out, in_off)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
+    decode_scalar(input, out)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn decode_scalar(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     let mut in_off = 0usize;
     let mut out_off = 0usize;
 

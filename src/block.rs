@@ -151,6 +151,48 @@ pub(crate) fn decode_tail(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// SIMD shared tables (used by both NEON and AVX2 paths)
+// ─────────────────────────────────────────────────────────────────────────
+
+// Per-digit splice indexes for the 4-block encode shuffle. Output position
+// of digit k of block i is `5*i + k`; positions ≥ 16 spill into out_2 (with
+// offset −16). Each v_dk is a u32x4 with the digit in byte 0/4/8/12 of its
+// lane, hence the source offsets `4*i`. Both NEON (vqtbx1q_u8) and AVX2
+// (PSHUFB, broadcast to both 128-bit halves) consume the identical patterns.
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[rustfmt::skip]
+pub(super) static IDX_OUT_1: [[u8; 16]; 5] = [
+    // k=0: out_1[0,5,10,15] ← src bytes 0,4,8,12
+    [0,    0xFF, 0xFF, 0xFF, 0xFF, 4,    0xFF, 0xFF, 0xFF, 0xFF, 8,    0xFF, 0xFF, 0xFF, 0xFF, 12],
+    // k=1: out_1[1,6,11] ← 0,4,8 (block 3 → out_2)
+    [0xFF, 0,    0xFF, 0xFF, 0xFF, 0xFF, 4,    0xFF, 0xFF, 0xFF, 0xFF, 8,    0xFF, 0xFF, 0xFF, 0xFF],
+    // k=2: out_1[2,7,12] ← 0,4,8
+    [0xFF, 0xFF, 0,    0xFF, 0xFF, 0xFF, 0xFF, 4,    0xFF, 0xFF, 0xFF, 0xFF, 8,    0xFF, 0xFF, 0xFF],
+    // k=3: out_1[3,8,13] ← 0,4,8
+    [0xFF, 0xFF, 0xFF, 0,    0xFF, 0xFF, 0xFF, 0xFF, 4,    0xFF, 0xFF, 0xFF, 0xFF, 8,    0xFF, 0xFF],
+    // k=4: out_1[4,9,14] ← 0,4,8
+    [0xFF, 0xFF, 0xFF, 0xFF, 0,    0xFF, 0xFF, 0xFF, 0xFF, 4,    0xFF, 0xFF, 0xFF, 0xFF, 8,    0xFF],
+];
+
+// Indexes for digits 1..4 of block 3 (src byte 12) spilling into out_2.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[rustfmt::skip]
+pub(super) static IDX_OUT_2: [[u8; 16]; 4] = [
+    [12,   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+    [0xFF, 12,   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+    [0xFF, 0xFF, 12,   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+    [0xFF, 0xFF, 0xFF, 12,   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+];
+
+// Mask used by the SIMD decoders: 0xFF for the 4 real-input lanes of the
+// padded tail register, 0 for the 12 padding lanes. Lets us suppress
+// validation noise from the padding bytes.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(super) static TAIL_VALID_MASK: [u8; 16] =
+    [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+// ─────────────────────────────────────────────────────────────────────────
 // NEON encoder (aarch64)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -172,52 +214,7 @@ mod neon {
         vreinterpretq_u8_u32, vreinterpretq_u32_u8, vrev32q_u8, vst1q_u8, vsubq_u8,
     };
 
-    // Per-digit splice indexes, computed at compile time and loaded
-    // from .rodata each call. Output position of digit k of block i is
-    // `5*i + k`; positions ≥ 16 spill into out_2 (with offset −16).
-    // Each v_dk is a u32x4 with the digit in byte 0/4/8/12 of its lane,
-    // hence the source offsets `4*i`.
-    static IDX_OUT_1: [[u8; 16]; 5] = [
-        // k=0: out_1[0,5,10,15] ← src bytes 0,4,8,12
-        [
-            0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF, 0xFF, 12,
-        ],
-        // k=1: out_1[1,6,11] ← 0,4,8 (block 3 → out_2)
-        [
-            0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF, 0xFF,
-        ],
-        // k=2: out_1[2,7,12] ← 0,4,8
-        [
-            0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF,
-        ],
-        // k=3: out_1[3,8,13] ← 0,4,8
-        [
-            0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF,
-        ],
-        // k=4: out_1[4,9,14] ← 0,4,8
-        [
-            0xFF, 0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF, 0xFF, 4, 0xFF, 0xFF, 0xFF, 0xFF, 8, 0xFF,
-        ],
-    ];
-    // Indexes for digits 1..4 spilling into out_2 (block 3, src byte 12).
-    static IDX_OUT_2: [[u8; 16]; 4] = [
-        [
-            12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF,
-        ],
-        [
-            0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF,
-        ],
-        [
-            0xFF, 0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF,
-        ],
-        [
-            0xFF, 0xFF, 0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF,
-        ],
-    ];
+    use super::{IDX_OUT_1, IDX_OUT_2, TAIL_VALID_MASK};
 
     /// Encodes 16 input bytes into 20 output characters using NEON.
     ///
@@ -339,10 +336,6 @@ mod neon {
         tail_buf[..4].copy_from_slice(&input[16..20]);
         let chars_tail = unsafe { vld1q_u8(tail_buf.as_ptr()) };
 
-        // Mask: 0xFF for the 4 real-input lanes of `chars_tail`, 0 for the
-        // 12 padding lanes — used to suppress validation noise from padding.
-        static TAIL_VALID_MASK: [u8; 16] =
-            [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let tail_valid_mask = unsafe { vld1q_u8(TAIL_VALID_MASK.as_ptr()) };
 
         // Char range validation: any byte not in [33, 126] is invalid.
@@ -511,6 +504,386 @@ mod neon {
             let swapped = vrev32q_u8(raw);
             vreinterpretq_u32_u8(swapped)
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AVX2 encoder / decoder (x86_64)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Processes 8 blocks per call (32 input bytes, 40 output chars) by
+// running the same SSE4.1 algorithm across both 128-bit lanes of an
+// `__m256i`. AVX2's lane-restricted byte/word ops (PSHUFB, PSHUFD,
+// BLEND) work fine here because the algorithm is fully per-lane —
+// each lane handles 4 independent blocks.
+//
+// On hosts without AVX2 the crate's runtime feature gate routes to
+// the scalar fallback (see `crate::encode_scalar` / `crate::decode_scalar`).
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) use avx2::{Avx2Encoder, try_decode_block_x8};
+
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    //! AVX2 encode/decode — 8 blocks per call.
+    //!
+    //! Both 128-bit lanes of each `__m256i` independently run the
+    //! algorithm we developed for SSE4.1 (4 blocks per lane, 8 total).
+    //! AVX2 byte/word ops are lane-restricted (PSHUFB / BLEND /
+    //! SHUFFLE_EPI32 / etc. operate per 128-bit half), but every
+    //! step of the algorithm is per-lane anyway, so that's fine.
+    //!
+    //! Every entry point is `unsafe fn` with
+    //! `#[target_feature(enable = "avx2")]`. The caller
+    //! (`crate::encode_into` / `crate::decode_into`) does a one-shot
+    //! `is_x86_feature_detected!("avx2")` check; on hosts lacking
+    //! AVX2 the crate routes to the scalar fallback.
+    //!
+    //! The module-level `#![allow(unsafe_op_in_unsafe_fn)]` keeps the
+    //! body of each `unsafe fn` an implicit unsafe scope on MSRV 1.85
+    //! (without it, each intrinsic call needs its own `unsafe { … }`).
+
+    #![allow(unsafe_op_in_unsafe_fn)]
+    #![allow(clippy::indexing_slicing)]
+
+    use crate::ops::{div_85, div_85_cube, div_85_sq};
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm_loadu_si128, _mm_storeu_si128, _mm256_add_epi32, _mm256_and_si256,
+        _mm256_broadcastsi128_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8, _mm256_cmpgt_epi32,
+        _mm256_extract_epi32, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm256_mullo_epi32, _mm256_or_si256, _mm256_set_m128i, _mm256_set1_epi8, _mm256_set1_epi32,
+        _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_srli_epi16, _mm256_storeu_si256,
+        _mm256_sub_epi32, _mm256_xor_si256,
+    };
+
+    use super::{IDX_OUT_1, IDX_OUT_2, TAIL_VALID_MASK};
+
+    static REV32_IDX: [u8; 16] = [3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12];
+
+    #[rustfmt::skip]
+    static ALPHABET_PADDED: &[u8; 96] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~\0\0\0\0\0\0\0\0\0\0\0";
+
+    #[rustfmt::skip]
+    static CHAR_TO_85_PADDED: [u8; 96] = [
+        62, 0xFF, 63, 64, 65, 66, 0xFF, 67, 68, 69, 70, 0xFF, 71, 0xFF, 0xFF, 0,
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 0xFF, 72, 73, 74, 75, 76, 77,
+        10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 0xFF, 0xFF, 0xFF, 78, 79, 80,
+        36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+        52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 81, 82, 83, 84, 0xFF, 0xFF,
+    ];
+
+    #[rustfmt::skip]
+    static IDX_DEC: [([u8; 16], [u8; 16]); 5] = [
+        (
+            [0, 0xFF, 0xFF, 0xFF, 5, 0xFF, 0xFF, 0xFF, 10, 0xFF, 0xFF, 0xFF, 15, 0xFF, 0xFF, 0xFF],
+            [0xFF; 16],
+        ),
+        (
+            [1, 0xFF, 0xFF, 0xFF, 6, 0xFF, 0xFF, 0xFF, 11, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0xFF],
+        ),
+        (
+            [2, 0xFF, 0xFF, 0xFF, 7, 0xFF, 0xFF, 0xFF, 12, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 1, 0xFF, 0xFF, 0xFF],
+        ),
+        (
+            [3, 0xFF, 0xFF, 0xFF, 8, 0xFF, 0xFF, 0xFF, 13, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 2, 0xFF, 0xFF, 0xFF],
+        ),
+        (
+            [4, 0xFF, 0xFF, 0xFF, 9, 0xFF, 0xFF, 0xFF, 14, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 3, 0xFF, 0xFF, 0xFF],
+        ),
+    ];
+
+    /// Loads a 16-byte index from .rodata and broadcasts it to both
+    /// 128-bit lanes of an `__m256i`.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for a 16-byte read. Caller has AVX2.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn broadcast16(ptr: *const u8) -> __m256i {
+        _mm256_broadcastsi128_si256(_mm_loadu_si128(ptr.cast::<__m128i>()))
+    }
+
+    /// AVX2 8-block encoder. Mirrors the structure of NEON's
+    /// `NeonEncoder` but processes 8 input blocks (32 bytes → 40 chars)
+    /// per call.
+    pub(crate) struct Avx2Encoder;
+
+    impl Avx2Encoder {
+        #[inline]
+        pub(crate) fn new() -> Self {
+            Self
+        }
+
+        /// Encode exactly 32 input bytes into exactly 40 output bytes.
+        ///
+        /// # Safety
+        /// Requires AVX2 to be available on the host CPU.
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        pub(crate) unsafe fn encode_block_x8(&self, in_bytes: &[u8; 32], out_bytes: &mut [u8; 40]) {
+            // Load 32 bytes (8 × 4-byte blocks) and reverse each 4-byte
+            // group to get 8 BE u32s.
+            let raw = _mm256_loadu_si256(in_bytes.as_ptr().cast::<__m256i>());
+            let n = _mm256_shuffle_epi8(raw, broadcast16(REV32_IDX.as_ptr()));
+
+            // Parallel-magic divides — 8 lanes wide.
+            let q1 = div_85(n);
+            let q2 = div_85_sq(n);
+            let q3 = div_85_cube(n);
+            let q4 = div_85_sq(q2);
+
+            // Five digits per block via lane-wise multiply-subtract.
+            let m85 = _mm256_set1_epi32(85);
+            let d0 = q4;
+            let d1 = _mm256_sub_epi32(q3, _mm256_mullo_epi32(q4, m85));
+            let d2 = _mm256_sub_epi32(q2, _mm256_mullo_epi32(q3, m85));
+            let d3 = _mm256_sub_epi32(q1, _mm256_mullo_epi32(q2, m85));
+            let d4 = _mm256_sub_epi32(n, _mm256_mullo_epi32(q1, m85));
+
+            // Splice 5 digits into out_1 (32 bytes; 16 per lane — each
+            // lane holds the first 16 chars of its 4-block group).
+            // PSHUFB is per-lane; the same index broadcast to both lanes
+            // does the right thing.
+            let idx0 = broadcast16(IDX_OUT_1[0].as_ptr());
+            let idx1 = broadcast16(IDX_OUT_1[1].as_ptr());
+            let idx2 = broadcast16(IDX_OUT_1[2].as_ptr());
+            let idx3 = broadcast16(IDX_OUT_1[3].as_ptr());
+            let idx4 = broadcast16(IDX_OUT_1[4].as_ptr());
+            let p0 = _mm256_shuffle_epi8(d0, idx0);
+            let p1 = _mm256_shuffle_epi8(d1, idx1);
+            let p2 = _mm256_shuffle_epi8(d2, idx2);
+            let p3 = _mm256_shuffle_epi8(d3, idx3);
+            let p4 = _mm256_shuffle_epi8(d4, idx4);
+            let out_1 = _mm256_or_si256(
+                _mm256_or_si256(p0, p1),
+                _mm256_or_si256(p2, _mm256_or_si256(p3, p4)),
+            );
+
+            // Same for out_2 (8 bytes total; 4 per lane — the trailing
+            // 4 chars of each 4-block group).
+            let i20 = broadcast16(IDX_OUT_2[0].as_ptr());
+            let i21 = broadcast16(IDX_OUT_2[1].as_ptr());
+            let i22 = broadcast16(IDX_OUT_2[2].as_ptr());
+            let i23 = broadcast16(IDX_OUT_2[3].as_ptr());
+            let q21 = _mm256_shuffle_epi8(d1, i20);
+            let q22 = _mm256_shuffle_epi8(d2, i21);
+            let q23 = _mm256_shuffle_epi8(d3, i22);
+            let q24 = _mm256_shuffle_epi8(d4, i23);
+            let out_2 = _mm256_or_si256(_mm256_or_si256(q21, q22), _mm256_or_si256(q23, q24));
+
+            // Digit value (0..84) → ASCII char.
+            let out_1 = byte_to_char85_avx2(out_1);
+            let out_2 = byte_to_char85_avx2(out_2);
+
+            // Store. Output layout is non-contiguous between lanes:
+            //   bytes  0..16  — lane 0's 16-char main
+            //   bytes 16..20  — lane 0's 4-char tail
+            //   bytes 20..36  — lane 1's 16-char main
+            //   bytes 36..40  — lane 1's 4-char tail
+            let lo_main = _mm256_extracti128_si256::<0>(out_1);
+            let hi_main = _mm256_extracti128_si256::<1>(out_1);
+            let lo_tail = _mm256_extract_epi32::<0>(out_2) as u32;
+            let hi_tail = _mm256_extract_epi32::<4>(out_2) as u32;
+
+            _mm_storeu_si128(out_bytes.as_mut_ptr().cast::<__m128i>(), lo_main);
+            std::ptr::write_unaligned(out_bytes.as_mut_ptr().add(16).cast::<u32>(), lo_tail);
+            _mm_storeu_si128(out_bytes.as_mut_ptr().add(20).cast::<__m128i>(), hi_main);
+            std::ptr::write_unaligned(out_bytes.as_mut_ptr().add(36).cast::<u32>(), hi_tail);
+        }
+    }
+
+    /// Maps 32 lane-wise digit values (0..84) to ASCII characters.
+    ///
+    /// Same chunk-index-selection trick as the SSE port (PSHUFB only
+    /// zeros on bit-7-set indexes), just doubled.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn byte_to_char85_avx2(x85: __m256i) -> __m256i {
+        let high_nib = _mm256_and_si256(_mm256_srli_epi16::<4>(x85), _mm256_set1_epi8(0x0F));
+        let low_nib = _mm256_and_si256(x85, _mm256_set1_epi8(0x0F));
+
+        let t0 = broadcast16(ALPHABET_PADDED.as_ptr());
+        let t1 = broadcast16(ALPHABET_PADDED.as_ptr().add(16));
+        let t2 = broadcast16(ALPHABET_PADDED.as_ptr().add(32));
+        let t3 = broadcast16(ALPHABET_PADDED.as_ptr().add(48));
+        let t4 = broadcast16(ALPHABET_PADDED.as_ptr().add(64));
+        let t5 = broadcast16(ALPHABET_PADDED.as_ptr().add(80));
+
+        let r0 = _mm256_shuffle_epi8(t0, low_nib);
+        let r1 = _mm256_shuffle_epi8(t1, low_nib);
+        let r2 = _mm256_shuffle_epi8(t2, low_nib);
+        let r3 = _mm256_shuffle_epi8(t3, low_nib);
+        let r4 = _mm256_shuffle_epi8(t4, low_nib);
+        let r5 = _mm256_shuffle_epi8(t5, low_nib);
+
+        let m0 = _mm256_cmpeq_epi8(high_nib, _mm256_setzero_si256());
+        let m1 = _mm256_cmpeq_epi8(high_nib, _mm256_set1_epi8(1));
+        let m2 = _mm256_cmpeq_epi8(high_nib, _mm256_set1_epi8(2));
+        let m3 = _mm256_cmpeq_epi8(high_nib, _mm256_set1_epi8(3));
+        let m4 = _mm256_cmpeq_epi8(high_nib, _mm256_set1_epi8(4));
+        let m5 = _mm256_cmpeq_epi8(high_nib, _mm256_set1_epi8(5));
+
+        _mm256_or_si256(
+            _mm256_or_si256(
+                _mm256_or_si256(_mm256_and_si256(r0, m0), _mm256_and_si256(r1, m1)),
+                _mm256_or_si256(_mm256_and_si256(r2, m2), _mm256_and_si256(r3, m3)),
+            ),
+            _mm256_or_si256(_mm256_and_si256(r4, m4), _mm256_and_si256(r5, m5)),
+        )
+    }
+
+    /// Maps 32 ASCII chars to base85 digit values (0..84) lane-wise.
+    /// Chars not in the alphabet (or out of [33, 126]) come back as 0xFF.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn char85_to_byte_avx2(chars: __m256i) -> __m256i {
+        let normalised = _mm256_sub_epi32(chars, _mm256_set1_epi8(33));
+        let high_nib = _mm256_and_si256(_mm256_srli_epi16::<4>(normalised), _mm256_set1_epi8(0x0F));
+        let low_nib = _mm256_and_si256(normalised, _mm256_set1_epi8(0x0F));
+
+        let t0 = broadcast16(CHAR_TO_85_PADDED.as_ptr());
+        let t1 = broadcast16(CHAR_TO_85_PADDED.as_ptr().add(16));
+        let t2 = broadcast16(CHAR_TO_85_PADDED.as_ptr().add(32));
+        let t3 = broadcast16(CHAR_TO_85_PADDED.as_ptr().add(48));
+        let t4 = broadcast16(CHAR_TO_85_PADDED.as_ptr().add(64));
+        let t5 = broadcast16(CHAR_TO_85_PADDED.as_ptr().add(80));
+
+        let r0 = _mm256_shuffle_epi8(t0, low_nib);
+        let r1 = _mm256_shuffle_epi8(t1, low_nib);
+        let r2 = _mm256_shuffle_epi8(t2, low_nib);
+        let r3 = _mm256_shuffle_epi8(t3, low_nib);
+        let r4 = _mm256_shuffle_epi8(t4, low_nib);
+        let r5 = _mm256_shuffle_epi8(t5, low_nib);
+
+        let m0 = _mm256_cmpeq_epi8(high_nib, _mm256_setzero_si256());
+        let m1 = _mm256_cmpeq_epi8(high_nib, _mm256_set1_epi8(1));
+        let m2 = _mm256_cmpeq_epi8(high_nib, _mm256_set1_epi8(2));
+        let m3 = _mm256_cmpeq_epi8(high_nib, _mm256_set1_epi8(3));
+        let m4 = _mm256_cmpeq_epi8(high_nib, _mm256_set1_epi8(4));
+        let m5 = _mm256_cmpeq_epi8(high_nib, _mm256_set1_epi8(5));
+
+        _mm256_or_si256(
+            _mm256_or_si256(
+                _mm256_or_si256(_mm256_and_si256(r0, m0), _mm256_and_si256(r1, m1)),
+                _mm256_or_si256(_mm256_and_si256(r2, m2), _mm256_and_si256(r3, m3)),
+            ),
+            _mm256_or_si256(_mm256_and_si256(r4, m4), _mm256_and_si256(r5, m5)),
+        )
+    }
+
+    /// AVX2 8-block decoder. 40 chars → 32 bytes.
+    ///
+    /// Returns `Err(())` (so the caller falls back to the scalar path,
+    /// which will surface a precise [`crate::DecodeError`]) when:
+    /// - any input byte is outside the base85 alphabet, or
+    /// - any of the eight 5-char blocks decodes to a value > `u32::MAX`.
+    ///
+    /// # Safety
+    /// Requires AVX2 on the host CPU.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn try_decode_block_x8(
+        input: &[u8; 40],
+        out: &mut [u8; 32],
+    ) -> Result<(), ()> {
+        // Layout the 40 chars into the 256-bit register so each
+        // 128-bit lane handles 4 blocks. Lane 0 ← chars 0..15
+        // (first 16 chars of blocks 0..3); lane 1 ← chars 20..35
+        // (first 16 chars of blocks 4..7). The 4-char tails (chars
+        // 16..19 and 36..39) go into a separate "chars_tail" with
+        // 12 zero-padding bytes per lane.
+        let chars_main_lo = _mm_loadu_si128(input.as_ptr().cast::<__m128i>());
+        let chars_main_hi = _mm_loadu_si128(input.as_ptr().add(20).cast::<__m128i>());
+        let chars_main = _mm256_set_m128i(chars_main_hi, chars_main_lo);
+
+        let mut tail_buf_lo = [0u8; 16];
+        let mut tail_buf_hi = [0u8; 16];
+        tail_buf_lo[..4].copy_from_slice(&input[16..20]);
+        tail_buf_hi[..4].copy_from_slice(&input[36..40]);
+        let chars_tail = _mm256_set_m128i(
+            _mm_loadu_si128(tail_buf_hi.as_ptr().cast::<__m128i>()),
+            _mm_loadu_si128(tail_buf_lo.as_ptr().cast::<__m128i>()),
+        );
+        let tail_valid_mask = broadcast16(TAIL_VALID_MASK.as_ptr());
+
+        // Range validation: chars must be in [33, 126].
+        let too_low_main = _mm256_cmpgt_epi8(_mm256_set1_epi8(33), chars_main);
+        let too_high_main = _mm256_cmpgt_epi8(chars_main, _mm256_set1_epi8(126));
+        let invalid_range_main = _mm256_or_si256(too_low_main, too_high_main);
+
+        let too_low_tail = _mm256_cmpgt_epi8(_mm256_set1_epi8(33), chars_tail);
+        let too_high_tail = _mm256_cmpgt_epi8(chars_tail, _mm256_set1_epi8(126));
+        let invalid_range_tail = _mm256_and_si256(
+            _mm256_or_si256(too_low_tail, too_high_tail),
+            tail_valid_mask,
+        );
+
+        // ASCII → digit lookup (0xFF for in-range invalid chars).
+        let digits_main = char85_to_byte_avx2(chars_main);
+        let digits_tail = char85_to_byte_avx2(chars_tail);
+
+        let invalid_dig_main = _mm256_cmpeq_epi8(digits_main, _mm256_set1_epi8(0xFF_u8 as i8));
+        let invalid_dig_tail = _mm256_and_si256(
+            _mm256_cmpeq_epi8(digits_tail, _mm256_set1_epi8(0xFF_u8 as i8)),
+            tail_valid_mask,
+        );
+
+        let any_invalid = _mm256_or_si256(
+            _mm256_or_si256(invalid_range_main, invalid_range_tail),
+            _mm256_or_si256(invalid_dig_main, invalid_dig_tail),
+        );
+        // _mm256_movemask_epi8 returns a 32-bit mask (one bit per
+        // byte of the 256-bit register).
+        if _mm256_movemask_epi8(any_invalid) != 0 {
+            return Err(());
+        }
+
+        // Permute digits into per-position vectors. Same indexes
+        // as the SSE path, broadcast to both lanes.
+        let v_dk = |idx_main: &[u8; 16], idx_tail: &[u8; 16]| -> __m256i {
+            let im = broadcast16(idx_main.as_ptr());
+            let it = broadcast16(idx_tail.as_ptr());
+            _mm256_or_si256(
+                _mm256_shuffle_epi8(digits_main, im),
+                _mm256_shuffle_epi8(digits_tail, it),
+            )
+        };
+        let v_d0 = v_dk(&IDX_DEC[0].0, &IDX_DEC[0].1);
+        let v_d1 = v_dk(&IDX_DEC[1].0, &IDX_DEC[1].1);
+        let v_d2 = v_dk(&IDX_DEC[2].0, &IDX_DEC[2].1);
+        let v_d3 = v_dk(&IDX_DEC[3].0, &IDX_DEC[3].1);
+        let v_d4 = v_dk(&IDX_DEC[4].0, &IDX_DEC[4].1);
+
+        // Horner: n = ((((d0·85 + d1)·85 + d2)·85 + d3)·85 + d4)
+        let m85 = _mm256_set1_epi32(85);
+        let n = _mm256_add_epi32(v_d1, _mm256_mullo_epi32(v_d0, m85));
+        let n = _mm256_add_epi32(v_d2, _mm256_mullo_epi32(n, m85));
+        let n = _mm256_add_epi32(v_d3, _mm256_mullo_epi32(n, m85));
+        let n = _mm256_add_epi32(v_d4, _mm256_mullo_epi32(n, m85));
+
+        // Overflow detection (bias-and-signed-cmpgt).
+        let d0_85_4 = _mm256_mullo_epi32(v_d0, _mm256_set1_epi32(52_200_625));
+        let bias = _mm256_set1_epi32(0x80000000_u32 as i32);
+        let n_b = _mm256_xor_si256(n, bias);
+        let d0_b = _mm256_xor_si256(d0_85_4, bias);
+        let overflow_mask = _mm256_cmpgt_epi32(d0_b, n_b);
+        if _mm256_movemask_epi8(overflow_mask) != 0 {
+            return Err(());
+        }
+
+        // Byte-swap each u32 lane to BE and store. Output is 32
+        // contiguous bytes (16 from each lane), so a single
+        // _mm256_storeu_si256 works.
+        let bytes_be = _mm256_shuffle_epi8(n, broadcast16(REV32_IDX.as_ptr()));
+        _mm256_storeu_si256(out.as_mut_ptr().cast::<__m256i>(), bytes_be);
+
+        Ok(())
     }
 }
 

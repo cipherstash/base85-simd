@@ -518,8 +518,7 @@ mod neon {
 // each lane handles 4 independent blocks.
 //
 // On hosts without AVX2 the crate's runtime feature gate routes to
-// the scalar fallback (see `crate::encode_into_scalar` /
-// `crate::decode_into_scalar`).
+// the scalar fallback (see `crate::encode_scalar` / `crate::decode_scalar`).
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) use avx2::{Avx2Encoder, try_decode_block_x8};
@@ -540,12 +539,9 @@ mod avx2 {
     //! `is_x86_feature_detected!("avx2")` check; on hosts lacking
     //! AVX2 the crate routes to the scalar fallback.
     //!
-    //! `#![allow(unsafe_op_in_unsafe_fn)]` lets each `unsafe fn` body
-    //! act as an implicit unsafe scope so individual intrinsic calls
-    //! don't need their own `unsafe { … }` wrapper. Without it, Rust
-    //! 1.85 (MSRV) would require those wrappers; newer toolchains
-    //! would then flag them as `unused_unsafe`. The override side-
-    //! steps both ends.
+    //! The module-level `#![allow(unsafe_op_in_unsafe_fn)]` keeps the
+    //! body of each `unsafe fn` an implicit unsafe scope on MSRV 1.85
+    //! (without it, each intrinsic call needs its own `unsafe { … }`).
 
     #![allow(unsafe_op_in_unsafe_fn)]
     #![allow(clippy::indexing_slicing)]
@@ -562,11 +558,6 @@ mod avx2 {
 
     use super::{IDX_OUT_1, IDX_OUT_2, TAIL_VALID_MASK};
 
-    // x86-only: NEON has `vrev32q_u8` for the byte-swap (no table needed),
-    // but PSHUFB needs an explicit shuffle index. Same for the per-position
-    // decode index pattern below — its shape is x86-specific (single 16-byte
-    // PSHUFB index per digit), where the NEON path uses `vqtbl2q_u8` over a
-    // 32-byte source and a different index layout.
     static REV32_IDX: [u8; 16] = [3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12];
 
     #[rustfmt::skip]

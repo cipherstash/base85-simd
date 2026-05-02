@@ -43,9 +43,3 @@ fn div_magic<const MAGIC: u32, const SHIFT: i32>(input: uint32x4_t) -> uint32x4_
         vshrq_n_u32(high_u32, SHIFT)
     }
 }
-
-// Correctness of `div_85*` is exercised transitively by the parity
-// tests in `tests/base85_parity.rs` (round-trips through encode/decode
-// on aarch64 hit this code on every iteration). The dedicated
-// quickchecks that previously lived here added no coverage worth the
-// duplication.

@@ -25,14 +25,9 @@
 //! `is_x86_feature_detected!("avx2")` check before invoking; on hosts
 //! lacking AVX2 the crate routes to the scalar fallback.
 //!
-//! `#![allow(unsafe_op_in_unsafe_fn)]` at the module level lets every
-//! `unsafe fn` body act as an implicit `unsafe` scope — without it,
-//! Rust 1.85 (MSRV) requires explicit `unsafe { … }` around each
-//! target-feature-gated intrinsic call even inside an `unsafe fn`
-//! with matching `target_feature`. Newer toolchains relax this, so
-//! the alternative would be 1.85-only inner blocks plus an
-//! `unused_unsafe` allow elsewhere; the override keeps the code
-//! readable across the full toolchain range.
+//! The module-level `#![allow(unsafe_op_in_unsafe_fn)]` keeps the body
+//! of each `unsafe fn` an implicit unsafe scope on MSRV 1.85 (without
+//! it, each intrinsic call needs its own `unsafe { … }`).
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -110,11 +105,3 @@ unsafe fn div_magic<const MAGIC: u32, const SHIFT: i32>(input: __m256i) -> __m25
 
     _mm256_srli_epi32::<SHIFT>(combined)
 }
-
-// `div_85*` correctness is exercised transitively by the parity tests
-// in `tests/base85_parity.rs`, which round-trip every encoded byte
-// through the AVX2 path on hosts where the runtime feature gate
-// admits it. A separate quickcheck here would either need a runtime
-// `is_x86_feature_detected!` skip (a smell) or RUSTFLAGS-based
-// compile-time gating for CI — neither earns its keep against the
-// existing transitive coverage.

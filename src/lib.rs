@@ -257,9 +257,6 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
     encode_scalar(input, out);
 }
 
-/// Pure-scalar encode loop. Used by the x86 path on CPUs lacking AVX2
-/// (rare on x86 server hardware after ~2013, but possible) and as the
-/// only encoder on non-aarch64, non-x86_64 targets.
 #[cfg(not(target_arch = "aarch64"))]
 fn encode_scalar(input: &[u8], out: &mut [u8]) {
     let mut in_off = 0usize;
@@ -426,8 +423,6 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     decode_scalar(input, out)
 }
 
-/// Pure-scalar decode loop. Used by the x86 path on CPUs lacking AVX2
-/// and as the only decoder on non-aarch64, non-x86_64 targets.
 #[cfg(not(target_arch = "aarch64"))]
 fn decode_scalar(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     let mut in_off = 0usize;

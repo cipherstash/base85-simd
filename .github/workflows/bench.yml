@@ -1,0 +1,69 @@
+name: bench
+
+# Manual-only trigger. Bench numbers from a shared GitHub Actions runner
+# are noisy (~5–15% variance), but useful for relative comparison between
+# `base85` and `base85-simd` on the same hardware, and for first-pass
+# validation that an x86 SIMD path actually beats scalar without needing
+# dedicated metal.
+#
+# Run via:
+#   gh workflow run bench --ref <branch-or-sha>
+# or from the Actions tab in the GitHub UI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to bench (defaults to the workflow's ref)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: cargo bench (ubuntu x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Hardware / feature inventory
+        run: |
+          echo "=== CPU ==="
+          lscpu | grep -E "^(Model name|Vendor ID|CPU\(s\)|CPU max MHz|CPU MHz|Caches|L[123])" || true
+          echo
+          echo "=== SIMD features available ==="
+          grep -oE '\b(sse[0-9._]*|ssse3|avx[0-9_]*)\b' /proc/cpuinfo \
+            | sort -u | tr '\n' ' '
+          echo
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo bench
+        run: cargo bench --bench encode --locked 2>&1 | tee bench-output.txt
+
+      - name: Summary table
+        if: always()
+        run: |
+          echo "## Encode/decode timings"
+          grep -E '^(encode|decode)/(base85|base85_simd)/' bench-output.txt \
+            | grep 'time:' || true
+
+      - name: Upload raw output + criterion HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            bench-output.txt
+            target/criterion/
+          if-no-files-found: error
+          retention-days: 30

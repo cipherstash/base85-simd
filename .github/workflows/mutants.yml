@@ -7,9 +7,10 @@ name: Mutants
 # tail handling around the SIMD kernels.
 #
 # Scoped with `--in-diff` to the PR's own changes, so the gate trips only when a
-# PR adds (or moves) logic its tests don't exercise. A manual dispatch sweeps
-# the whole crate; locally, `mise run mutants`. Shared config (excludes,
-# timeouts) lives in .cargo/mutants.toml.
+# PR adds (or moves) logic its tests don't exercise. A PR that changes the
+# mutants config or this workflow, and a manual dispatch, sweep the whole
+# crate; locally, `mise run mutants`. Shared config (excludes, timeouts) lives
+# in .cargo/mutants.toml.
 #
 # Runs on both arches: the NEON dispatch only compiles on aarch64 and the AVX2
 # dispatch and scalar fallback only on x86_64. cargo-mutants doesn't evaluate
@@ -40,9 +41,11 @@ jobs:
   mutants:
     name: Mutants gate / ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
-    # A PR run mutates only its diff; one still going after an hour is
-    # mutating far more than that. A manual dispatch sweeps the whole crate.
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 60 || 360 }}
+    # A whole-crate sweep (~150 mutants per arch) takes well under two hours
+    # at `-j 2`; a diff-scoped run, minutes. Either still going after two
+    # hours is stuck, so fail it rather than hold the runner for GitHub's
+    # 6-hour default.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -76,17 +79,28 @@ jobs:
           cargo binstall -y cargo-mutants
 
       - name: Compute PR diff
+        id: diff
         # The checkout is GitHub's test merge of the PR into its base, so its
         # first parent is the base commit this tree was built on. Diff against
         # that rather than `github.base_ref`, which can be stale if the PR was
         # retargeted. PR-only: a manual dispatch sweeps the whole crate.
+        #
+        # A PR that changes the mutants config or this workflow sweeps the
+        # whole crate too: its excludes can hide mutants anywhere, not just on
+        # the changed lines, and `--in-diff` only mutates changed lines.
         if: github.event_name == 'pull_request'
         run: |
           if [ "$(git rev-list --parents -n 1 HEAD | wc -w)" -ne 3 ]; then
             echo "::error::Expected the PR's test merge commit at HEAD; got $(git rev-parse HEAD)."
             exit 1
           fi
+          if git diff --name-only HEAD^1 HEAD | grep -qxE '\.cargo/mutants\.toml|\.github/workflows/mutants\.yml'; then
+            echo "Mutants config changed: sweeping the whole crate."
+            echo "scope=full" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           git diff HEAD^1 HEAD > pr.diff
+          echo "scope=diff" >> "$GITHUB_OUTPUT"
           echo "Changed lines under mutation:"
           cat pr.diff
 
@@ -99,10 +113,10 @@ jobs:
           EXCLUDE_RE: ${{ matrix.exclude_re }}
         run: |
           set +e
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            cargo mutants --no-shuffle -vV --exclude-re "$EXCLUDE_RE" --in-diff pr.diff
+          if [ "${{ steps.diff.outputs.scope }}" = "diff" ]; then
+            cargo mutants --no-shuffle -vV -j 2 --exclude-re "$EXCLUDE_RE" --in-diff pr.diff
           else
-            cargo mutants --no-shuffle -vV --exclude-re "$EXCLUDE_RE"
+            cargo mutants --no-shuffle -vV -j 2 --exclude-re "$EXCLUDE_RE"
           fi
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
@@ -117,7 +131,8 @@ jobs:
           timeout=$(count timeout.txt)
           {
             echo '<!-- cargo-mutants-report-${{ matrix.arch }} -->'
-            echo '## 🧬 Mutation testing — ${{ matrix.arch }} (cargo-mutants, `--in-diff`)'
+            if [ "${{ steps.diff.outputs.scope }}" = "diff" ]; then scope='`--in-diff`'; else scope='whole crate'; fi
+            echo "## 🧬 Mutation testing — ${{ matrix.arch }} (cargo-mutants, $scope)"
             echo
             if [ ! -d "$out" ]; then
               # No output dir: either nothing to mutate (exit 0) or the run
@@ -140,7 +155,7 @@ jobs:
               [ -s "$out/timeout.txt" ] && { echo '# timed out (treated as surviving):'; cat "$out/timeout.txt"; }
               echo '```'
             elif [ "${{ steps.mutants.outputs.exit_code }}" = "0" ]; then
-              echo "✅ Every mutant in the changed lines was caught by a test."
+              echo "✅ Every mutant was caught by a test."
             else
               echo "⚠️ cargo-mutants exited ${{ steps.mutants.outputs.exit_code }} with no surviving mutants recorded — check the workflow run logs."
             fi
@@ -173,7 +188,7 @@ jobs:
         run: |
           out=mutants.out
           if [ -s "$out/missed.txt" ] || [ -s "$out/timeout.txt" ]; then
-            echo "::error::Surviving mutants in the PR diff — add tests that catch them (see the PR comment)."
+            echo "::error::Surviving mutants — add tests that catch them (see the PR comment)."
             [ -s "$out/missed.txt" ] && cat "$out/missed.txt"
             [ -s "$out/timeout.txt" ] && cat "$out/timeout.txt"
             exit 1
@@ -189,4 +204,4 @@ jobs:
               exit 1
               ;;
           esac
-          echo "No surviving mutants in the PR diff."
+          echo "No surviving mutants."

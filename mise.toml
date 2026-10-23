@@ -7,21 +7,16 @@ rust = "latest"
 
 [tasks.mutants]
 description = "Mutation testing (cargo-mutants) across the crate — surfaces logic the tests don't actually pin down"
-# Reads excludes/timeouts from .cargo/mutants.toml. CI runs this `--in-diff` as
-# a per-PR gate (.github/workflows/mutants.yml), mutating only changed lines.
-# Excludes the other arch's dispatch, which this host doesn't compile — the
-# same per-arch `--exclude-re` as the CI matrix.
-run = '''
-case "$(uname -m)" in
-  arm64|aarch64) other='avx2|_scalar' ;;
-  *) other='_neon|neon::|ops/aarch64\.rs' ;;
-esac
-cargo mutants --exclude-re "$other"
-'''
+# Sweeps the whole crate. scripts/mutants.sh adds this host's per-arch
+# excludes, the same script CI's gate (.github/workflows/mutants.yml) runs;
+# .cargo/mutants.toml holds the rest of the config. Extra arguments pass
+# through, e.g. `mise run mutants -- --in-diff pr.diff`.
+run = "scripts/mutants.sh"
 
 [tasks.miri]
 description = "Run the tests under Miri on the x86_64 AVX2 and scalar paths (the NEON path can't run under Miri)"
-# Same two runs as .github/workflows/miri.yml. On an aarch64 host Miri
+# The same four runs as .github/workflows/miri.yml: each path under the
+# default models, then under the strict ones. On an aarch64 host Miri
 # cross-interprets the x86_64 target, so this works on Apple Silicon too.
 env.QUICKCHECK_TESTS = "16"
 run = [
@@ -29,4 +24,11 @@ run = [
   "rustup +nightly target add x86_64-unknown-linux-gnu",
   "RUSTFLAGS=-Ctarget-feature=+avx2 cargo +nightly miri test --target x86_64-unknown-linux-gnu --target-dir target/miri-avx2",
   "cargo +nightly miri test --target x86_64-unknown-linux-gnu --target-dir target/miri-scalar",
+  "RUSTFLAGS=-Ctarget-feature=+avx2 MIRIFLAGS='-Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check' cargo +nightly miri test --target x86_64-unknown-linux-gnu --target-dir target/miri-avx2-strict",
+  "MIRIFLAGS='-Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check' cargo +nightly miri test --target x86_64-unknown-linux-gnu --target-dir target/miri-scalar-strict",
 ]
+
+[tasks.asan]
+description = "Run the tests under AddressSanitizer on aarch64 — the NEON path Miri can't interpret"
+# Same run as .github/workflows/sanitizers.yml. Needs an Apple Silicon host.
+run = "RUSTFLAGS=-Zsanitizer=address cargo +nightly test --lib --tests --target aarch64-apple-darwin --target-dir target/asan"

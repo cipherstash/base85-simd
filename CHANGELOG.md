@@ -7,13 +7,19 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Changed
+
 - The aarch64 NEON decode kernel takes `&[u8; 20]` / `&mut [u8; 16]` instead
   of open slices, so its loads and stores are in bounds by type and it is no
-  longer an `unsafe fn` (matching the AVX2 kernel). Throughput is unchanged
-  from 256 bytes up; inputs under 256 bytes decode ~1–2 ns slower.
+  longer an `unsafe fn` (matching the AVX2 kernel). Throughput is within
+  measurement noise (±3%) of 0.1.0 from 16 bytes to 1 MiB, except that
+  encoding 16 bytes takes about 1 ns (6%) longer.
 
-- CI: Miri runs the test suite on the x86_64 AVX2 and scalar paths, and a
-  cargo-mutants gate on aarch64 and x86_64 fails PRs that leave mutants alive.
+### Added
+
+- CI: Miri runs the test suite on the x86_64 AVX2 and scalar paths,
+  AddressSanitizer runs it on the aarch64 NEON path, and a cargo-mutants gate
+  on aarch64 and x86_64 fails PRs that leave mutants alive.
 - Tests: the x86_64 scalar fallback, `DecodeError`'s `Display` output, and
   `decode`'s loop bounds with mismatched buffers are now tested directly.
 

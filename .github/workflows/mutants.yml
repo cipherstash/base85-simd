@@ -7,15 +7,31 @@ name: Mutants
 # tail handling around the SIMD kernels.
 #
 # Scoped with `--in-diff` to the PR's own changes, so the gate trips only when a
-# PR adds (or moves) logic its tests don't exercise. A PR that changes the
-# mutants config or this workflow, and a manual dispatch, sweep the whole
-# crate; locally, `mise run mutants`. Shared config (excludes, timeouts) lives
-# in .cargo/mutants.toml.
+# PR adds (or moves) logic its tests don't exercise. Three cases sweep the
+# whole crate instead (~130 mutants per arch):
+#
+# - a PR that changes the mutants setup (this workflow, .cargo/mutants.toml or
+#   scripts/mutants.sh), whose excludes can hide mutants anywhere;
+# - a PR that changes src/ or tests/ but whose changed lines yield no
+#   mutants (a rename, a moved function, a deleted test), which would
+#   otherwise pass without testing anything;
+# - a manual dispatch.
+#
+# Locally, `mise run mutants` sweeps the whole crate.
 #
 # Runs on both arches: the NEON dispatch only compiles on aarch64 and the AVX2
 # dispatch and scalar fallback only on x86_64. cargo-mutants doesn't evaluate
-# `#[cfg]`, so each job excludes the other arch's code, whose mutants would
-# otherwise "survive" because they aren't compiled at all.
+# `#[cfg]`, so scripts/mutants.sh excludes the other arch's code, whose
+# mutants would otherwise "survive" because they aren't compiled at all.
+# Excludes that hold on every arch, and timeouts, live in .cargo/mutants.toml.
+#
+# Adapted from vitaminc's gate, minus three things that don't apply here:
+# - The toolchain is `@stable`, not pinned: vitaminc pins because its
+#   trybuild snapshots record one compiler's wording, and this crate has none.
+#   ci.yml tests on stable too.
+# - There's no `changes` job: this workflow has no path filter, so it always
+#   reports and can be a required check as is.
+# - Actions are on the same major versions as ci.yml.
 #
 # To soften to report-only, drop the "Enforce" step; the sticky comment keeps
 # working either way. To block merges, mark both "Mutants gate" checks as
@@ -52,10 +68,8 @@ jobs:
         include:
           - arch: aarch64
             os: macos-latest
-            exclude_re: "avx2|_scalar"
           - arch: x86_64
             os: ubuntu-latest
-            exclude_re: "_neon|neon::|ops/aarch64\\.rs"
 
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +80,8 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-mutants
         # Prebuilt binary via cargo-binstall — far faster than `cargo install`.
@@ -85,21 +100,31 @@ jobs:
         # that rather than `github.base_ref`, which can be stale if the PR was
         # retargeted. PR-only: a manual dispatch sweeps the whole crate.
         #
-        # A PR that changes the mutants config or this workflow sweeps the
-        # whole crate too: its excludes can hide mutants anywhere, not just on
-        # the changed lines, and `--in-diff` only mutates changed lines.
+        #
+        # Two cases sweep the whole crate instead (see the header): a change
+        # to the mutants setup, and a change to src/ or tests/ whose changed
+        # lines yield no mutants.
         if: github.event_name == 'pull_request'
         run: |
           if [ "$(git rev-list --parents -n 1 HEAD | wc -w)" -ne 3 ]; then
             echo "::error::Expected the PR's test merge commit at HEAD; got $(git rev-parse HEAD)."
             exit 1
           fi
-          if git diff --name-only HEAD^1 HEAD | grep -qxE '\.cargo/mutants\.toml|\.github/workflows/mutants\.yml'; then
-            echo "Mutants config changed: sweeping the whole crate."
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          if grep -qxE '\.cargo/mutants\.toml|\.github/workflows/mutants\.yml|scripts/mutants\.sh' <<<"$changed"; then
+            echo "Mutants setup changed: sweeping the whole crate."
             echo "scope=full" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git diff HEAD^1 HEAD > pr.diff
+          if grep -qE '^(src|tests)/' <<<"$changed"; then
+            n=$(scripts/mutants.sh --list --in-diff pr.diff | grep -c . || true)
+            if [ "$n" -eq 0 ]; then
+              echo "Rust changes yield no mutants on their own lines: sweeping the whole crate."
+              echo "scope=full" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
           echo "scope=diff" >> "$GITHUB_OUTPUT"
           echo "Changed lines under mutation:"
           cat pr.diff
@@ -109,14 +134,12 @@ jobs:
         # Don't fail here: the Enforce step is authoritative, and the sticky
         # comment must be posted first.
         continue-on-error: true
-        env:
-          EXCLUDE_RE: ${{ matrix.exclude_re }}
         run: |
           set +e
           if [ "${{ steps.diff.outputs.scope }}" = "diff" ]; then
-            cargo mutants --no-shuffle -vV -j 2 --exclude-re "$EXCLUDE_RE" --in-diff pr.diff
+            scripts/mutants.sh --no-shuffle -vV -j 2 --in-diff pr.diff
           else
-            cargo mutants --no-shuffle -vV -j 2 --exclude-re "$EXCLUDE_RE"
+            scripts/mutants.sh --no-shuffle -vV -j 2
           fi
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
@@ -132,7 +155,7 @@ jobs:
           {
             echo '<!-- cargo-mutants-report-${{ matrix.arch }} -->'
             if [ "${{ steps.diff.outputs.scope }}" = "diff" ]; then scope='`--in-diff`'; else scope='whole crate'; fi
-            echo "## 🧬 Mutation testing — ${{ matrix.arch }} (cargo-mutants, $scope)"
+            echo "## Mutation testing — ${{ matrix.arch }} (cargo-mutants, $scope)"
             echo
             if [ ! -d "$out" ]; then
               # No output dir: either nothing to mutate (exit 0) or the run
@@ -140,7 +163,7 @@ jobs:
               if [ "${{ steps.mutants.outputs.exit_code }}" = "0" ]; then
                 echo "No mutants were generated for the changed lines."
               else
-                echo "⚠️ cargo-mutants did not complete (exit ${{ steps.mutants.outputs.exit_code }}) before producing results — check the workflow run logs."
+                echo "**Warning:** cargo-mutants did not complete (exit ${{ steps.mutants.outputs.exit_code }}) before producing results — check the workflow run logs."
               fi
               exit 0
             fi
@@ -155,9 +178,9 @@ jobs:
               [ -s "$out/timeout.txt" ] && { echo '# timed out (treated as surviving):'; cat "$out/timeout.txt"; }
               echo '```'
             elif [ "${{ steps.mutants.outputs.exit_code }}" = "0" ]; then
-              echo "✅ Every mutant was caught by a test."
+              echo "Every mutant was caught by a test."
             else
-              echo "⚠️ cargo-mutants exited ${{ steps.mutants.outputs.exit_code }} with no surviving mutants recorded — check the workflow run logs."
+              echo "**Warning:** cargo-mutants exited ${{ steps.mutants.outputs.exit_code }} with no surviving mutants recorded — check the workflow run logs."
             fi
           } > mutants-comment.md
           cat mutants-comment.md

@@ -11,7 +11,7 @@ homepage = "https://github.com/cipherstash/base85-simd"
 readme = "README.md"
 keywords = ["base85", "ascii85", "simd", "neon", "encoding"]
 categories = ["encoding"]
-exclude = ["*.xlsx", ".DS_Store", "mise.toml", ".cargo"]
+exclude = ["*.xlsx", ".DS_Store", "mise.toml", ".cargo", "scripts"]
 
 [package.metadata.docs.rs]
 # Build docs for both SIMD targets so the per-arch entry points

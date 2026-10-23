@@ -1,0 +1,55 @@
+name: Sanitizers
+
+# Runs the test suite under AddressSanitizer on aarch64. This is the NEON
+# path's memory-safety check: Miri (miri.yml) can't interpret the NEON table
+# lookups, so it covers only x86_64. ASan runs the native NEON code and
+# catches out-of-bounds loads and stores, the class of bug the kernels'
+# `vld1q_u8` / `vst1q_u8` could have.
+#
+# The std library isn't instrumented (no `-Zbuild-std`): every load and store
+# this crate's `unsafe` makes is in the crate itself, which is.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/sanitizers.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel an in-flight run when the PR is pushed again — only the latest matters.
+concurrency:
+  group: sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  asan:
+    name: asan / aarch64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: asan
+
+      - name: Test under AddressSanitizer
+        # `--target` keeps the sanitizer off build scripts and proc macros,
+        # which would otherwise fail to link. Doctests are left out: rustdoc
+        # takes its flags from RUSTDOCFLAGS and would build them uninstrumented.
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+        run: cargo +nightly test --locked --lib --tests --target aarch64-apple-darwin --target-dir target/asan

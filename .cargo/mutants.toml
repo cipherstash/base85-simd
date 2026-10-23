@@ -5,27 +5,25 @@
 # the suite does not actually pin down. For an encoder that is the offset
 # arithmetic, chunk-loop guards and tail handling.
 #
-# CI runs this `--in-diff` as a per-PR gate (.github/workflows/mutants.yml) on
-# both aarch64 and x86_64; `mise run mutants` runs the whole crate locally. Both
-# read the settings below, so they stay in sync.
-#
-# cargo-mutants doesn't evaluate `#[cfg]`, so it also mutates code the host
-# doesn't compile, and every such mutant "survives". Those are excluded per
-# host, not here: mutants.yml and the mise task pass `--exclude-re` for the
-# other arch's dispatch (`*_neon` / `*_avx2`, `neon::`, `ops/aarch64.rs`, and
-# the scalar fallback, which aarch64 never compiles). `unsafe fn`s, which
-# hold the SIMD intrinsics, aren't mutated at all; Miri (miri.yml) covers them.
+# Run it through scripts/mutants.sh, which adds the per-arch excludes this
+# file can't express (cargo-mutants doesn't evaluate `#[cfg]`, so each host
+# excludes the arch it doesn't compile). CI (.github/workflows/mutants.yml)
+# runs it on aarch64 and x86_64, mutating a PR's changed lines, or the whole
+# crate when the PR changes the mutants setup or its diff yields no mutants;
+# `mise run mutants` sweeps the whole crate locally. `unsafe fn`s, which
+# hold the AVX2 intrinsics, aren't mutated at all; Miri (miri.yml) covers
+# them.
 
 exclude_re = [
     # Not compiled on any host we test: `encode_into_portable` /
     # `decode_into_portable` are the one-line scalar dispatch for targets
     # that are neither aarch64 nor x86_64.
     "_portable",
-    # Equivalent mutant: the tail check in each encode loop. With no tail,
+    # Equivalent mutant: the encode tail check. With no tail,
     # `out_off == out.len()`, so `out.get_mut(out_off..out_off + 1)` is `None`
     # and `encode_tail` is skipped whether the guard is `> 0` or `>= 0`. No
     # input can tell them apart. The guard's other mutants stay gated.
-    "replace > with >= in encode_(into_neon|into_avx2|scalar)$",
+    "replace > with >= in encode_blocks_from$",
     # Checked by Miri, not by output: the `!is_x86_feature_detected!("avx2")`
     # check in each AVX2 dispatch. Inverting it on an AVX2 host routes every
     # call to the scalar fallback, which returns the same bytes, so no test

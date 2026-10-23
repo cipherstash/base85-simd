@@ -318,19 +318,11 @@ mod neon {
     /// - any of the four 5-char blocks decodes to a value > `u32::MAX`.
     ///
     /// On success, exactly 16 big-endian bytes are written to `out`.
-    ///
-    /// # Safety
-    ///
-    /// `input` must point to at least 20 readable bytes; `out` must point
-    /// to at least 16 writable bytes. (We take open slices rather than
-    /// `&[u8; 20]` / `&mut [u8; 16]` because the fixed-array form costs
-    /// ~4× on the hot decode loop — see the comment in `decode_into`.)
     #[inline]
-    pub(crate) unsafe fn try_decode_block_x4(input: &[u8], out: &mut [u8]) -> Result<(), ()> {
-        debug_assert!(input.len() >= 20);
-        debug_assert!(out.len() >= 16);
+    pub(crate) fn try_decode_block_x4(input: &[u8; 20], out: &mut [u8; 16]) -> Result<(), ()> {
         // Load chars 0..16 directly; load chars 16..19 into the low 4 lanes
         // of a zero-padded vector so we can use a unified TBL pipeline.
+        // SAFETY: `input` is `&[u8; 20]`, so its first 16 bytes are readable.
         let chars_main = unsafe { vld1q_u8(input.as_ptr()) };
         let mut tail_buf = [0u8; 16];
         tail_buf[..4].copy_from_slice(&input[16..20]);
@@ -439,6 +431,7 @@ mod neon {
         // Store as big-endian: byte-swap each u32 lane, then store 16 bytes.
         let bytes_le = unsafe { vreinterpretq_u8_u32(n) };
         let bytes_be = unsafe { vrev32q_u8(bytes_le) };
+        // SAFETY: `out` is `&mut [u8; 16]`, exactly one vector's worth.
         unsafe { vst1q_u8(out.as_mut_ptr(), bytes_be) };
 
         Ok(())

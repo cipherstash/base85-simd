@@ -268,55 +268,50 @@ fn encode_scalar(input: &[u8], out: &mut [u8]) {
     }
 }
 
-// SAFETY-bearing decode loop: the NEON entry point takes open slices
-// (`&[u8]` / `&mut [u8]`) rather than fixed-size array references because
-// the fixed-array form forces an extra `slice::get` + `TryFrom` chain at
-// every iteration that LLVM doesn't fold across the SIMD call boundary.
-// Benchmarking showed `decode/1024` at ~1 µs with the safe-helper form
-// vs ~226 ns with this form (~4× difference).
-//
-// The slicing inside the loop is `clippy::indexing_slicing`-free because
-// we use `.get()` / `.get_mut()` everywhere. The `unsafe` block on the
-// SIMD call documents the size invariants the loop guard upholds.
 #[cfg(target_arch = "aarch64")]
-#[allow(
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
-    reason = "infallible / in-bounds by loop-condition invariant; see SAFETY comment"
-)]
 fn decode_into_neon(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     use block::try_decode_block_x4;
 
     let mut in_off = 0usize;
     let mut out_off = 0usize;
 
-    while in_off + 20 <= input.len() && out_off + 16 <= out.len() {
-        // SAFETY: `in_off + 20 <= input.len()` and `out_off + 16 <=
-        // out.len()` are checked in the loop guard, so the open-slice
-        // arguments below carry the size invariants `try_decode_block_x4`
-        // requires (≥20 readable / ≥16 writable bytes).
-        let neon_ok = unsafe { try_decode_block_x4(&input[in_off..], &mut out[out_off..]) }.is_ok();
-
-        if neon_ok {
-            in_off += 20;
-            out_off += 16;
-        } else {
+    // 20-char (4-block) NEON chunks. `chunk_at` hands the kernel
+    // exactly-sized arrays, so its loads and stores are in bounds by type.
+    // On per-chunk failure (invalid char or u32 overflow), replay the same
+    // chunk scalar so the resulting DecodeError carries the precise failing
+    // byte position.
+    while let (Some(in_chunk), Some(out_chunk)) = (
+        chunk_at::<20>(input, in_off),
+        chunk_at_mut::<16>(out, out_off),
+    ) {
+        if try_decode_block_x4(in_chunk, out_chunk).is_err() {
             for _ in 0..4 {
-                let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
-                let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
+                let Some(block) = chunk_at::<5>(input, in_off) else {
+                    return Ok(());
+                };
+                let Some(chunk) = chunk_at_mut::<4>(out, out_off) else {
+                    return Ok(());
+                };
                 decode_block(block, chunk, in_off)?;
-                in_off += 5;
-                out_off += 4;
+                in_off = in_off.saturating_add(5);
+                out_off = out_off.saturating_add(4);
             }
+        } else {
+            in_off = in_off.saturating_add(20);
+            out_off = out_off.saturating_add(16);
         }
     }
 
-    while in_off + 5 <= input.len() && out_off + 4 <= out.len() {
-        let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
-        let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
+    while in_off.saturating_add(5) <= input.len() {
+        let Some(block) = chunk_at::<5>(input, in_off) else {
+            return Ok(());
+        };
+        let Some(chunk) = chunk_at_mut::<4>(out, out_off) else {
+            return Ok(());
+        };
         decode_block(block, chunk, in_off)?;
-        in_off += 5;
-        out_off += 4;
+        in_off = in_off.saturating_add(5);
+        out_off = out_off.saturating_add(4);
     }
 
     let tail_in_len = input.len().saturating_sub(in_off);
@@ -801,12 +796,11 @@ mod tests {
         }
     }
 
-    /// `decode` sizes `out` exactly from `input`, so the input and output
-    /// halves of each decode loop guard are redundant there: break one and
-    /// the other still stops the loop. Those guards are what keep the SIMD
-    /// kernel's loads and stores in bounds, so check each half on its own by
-    /// calling `decode_into` with mismatched buffers. A broken guard hands
-    /// the kernel a short slice and trips its `debug_assert!`s.
+    /// `decode` sizes `out` exactly from `input`, so through it the input
+    /// and output bounds of each decode loop always run out together, and a
+    /// loop that checked only one of them would pass every other test.
+    /// Calling `decode_into` with mismatched buffers checks each bound on
+    /// its own: decode what fits, touch nothing past either buffer.
     #[test]
     fn decode_into_stays_in_bounds_with_mismatched_buffers() {
         let input: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37)).collect();

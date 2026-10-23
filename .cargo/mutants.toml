@@ -26,6 +26,12 @@ exclude_re = [
     # and `encode_tail` is skipped whether the guard is `> 0` or `>= 0`. No
     # input can tell them apart. The guard's other mutants stay gated.
     "replace > with >= in encode_(into_neon|into_avx2|scalar)$",
+    # Checked by Miri, not by output: the `!is_x86_feature_detected!("avx2")`
+    # check in each AVX2 dispatch. Inverting it on an AVX2 host routes every
+    # call to the scalar fallback, which returns the same bytes, so no test
+    # can tell. On a host without AVX2 it would run AVX2 code, which is UB;
+    # the Miri `scalar` job (miri.yml) builds without AVX2 and fails on that.
+    "delete ! in (encode|decode)_into_avx2$",
 ]
 
 # Property tests (quickcheck, 10k cases) run slower under mutation than a clean

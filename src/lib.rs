@@ -17,6 +17,16 @@ mod ops;
 use block::{decode_block, decode_tail, encode_block, encode_tail};
 use std::fmt;
 
+// Each target compiles exactly one `encode_into` / `decode_into` variant. The
+// per-arch names keep their cargo-mutants names distinct, so a mutation run
+// can exclude the variants its host doesn't compile (see mutants.yml).
+#[cfg(target_arch = "x86_64")]
+use {decode_into_avx2 as decode_into, encode_into_avx2 as encode_into};
+#[cfg(target_arch = "aarch64")]
+use {decode_into_neon as decode_into, encode_into_neon as encode_into};
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+use {decode_into_portable as decode_into, encode_into_portable as encode_into};
+
 /// Errors returned by [`decode`].
 ///
 /// Marked `#[non_exhaustive]` — match arms must include `_ => …` so future
@@ -122,7 +132,7 @@ fn chunk_at_mut<const N: usize>(slice: &mut [u8], off: usize) -> Option<&mut [u8
 }
 
 #[cfg(target_arch = "aarch64")]
-fn encode_into(input: &[u8], out: &mut [u8]) {
+fn encode_into_neon(input: &[u8], out: &mut [u8]) {
     use block::NeonEncoder;
 
     let encoder = NeonEncoder::new();
@@ -169,7 +179,7 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn encode_into(input: &[u8], out: &mut [u8]) {
+fn encode_into_avx2(input: &[u8], out: &mut [u8]) {
     use block::Avx2Encoder;
 
     // Runtime feature gate: the AVX2 intrinsics are gated on
@@ -225,7 +235,7 @@ fn encode_into(input: &[u8], out: &mut [u8]) {
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-fn encode_into(input: &[u8], out: &mut [u8]) {
+fn encode_into_portable(input: &[u8], out: &mut [u8]) {
     encode_scalar(input, out);
 }
 
@@ -274,7 +284,7 @@ fn encode_scalar(input: &[u8], out: &mut [u8]) {
     clippy::indexing_slicing,
     reason = "infallible / in-bounds by loop-condition invariant; see SAFETY comment"
 )]
-fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
+fn decode_into_neon(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     use block::try_decode_block_x4;
 
     let mut in_off = 0usize;
@@ -329,7 +339,7 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     clippy::indexing_slicing,
     reason = "infallible / in-bounds by loop-condition invariant; see SAFETY comment"
 )]
-fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
+fn decode_into_avx2(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     use block::try_decode_block_x8;
 
     // Runtime feature gate: AVX2 needed for the fast path; otherwise
@@ -391,7 +401,7 @@ fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-fn decode_into(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
+fn decode_into_portable(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     decode_scalar(input, out)
 }
 
@@ -436,6 +446,12 @@ fn decode_scalar(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
 mod tests {
     use super::*;
     use quickcheck::{Gen, QuickCheck, quickcheck};
+
+    /// Cases per high-iteration property test. Miri interprets every
+    /// instruction, so under it the property tests shrink to a handful of
+    /// cases: enough to drive random lengths through the SIMD loads and
+    /// stores, not a correctness sweep (the native run does that).
+    const QC_TESTS: u64 = if cfg!(miri) { 16 } else { 10_000 };
 
     // ──────────────────────────────────────────────────────────────────
     // Section A — Basic correctness
@@ -502,6 +518,10 @@ mod tests {
 
     /// 1 MiB stress test with deterministic content.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "too slow under Miri; same loop as the shorter round trips"
+    )]
     fn round_trip_one_megabyte() {
         let input: Vec<u8> = (0..(1u32 << 20))
             .map(|i| (i.wrapping_mul(2_654_435_761)) as u8)
@@ -713,7 +733,7 @@ mod tests {
         }
         QuickCheck::new()
             .r#gen(Gen::new(1024))
-            .tests(10_000)
+            .tests(QC_TESTS)
             .quickcheck(prop as fn(Vec<u8>) -> bool);
     }
 
@@ -724,7 +744,7 @@ mod tests {
         }
         QuickCheck::new()
             .r#gen(Gen::new(1024))
-            .tests(10_000)
+            .tests(QC_TESTS)
             .quickcheck(prop as fn(Vec<u8>) -> bool);
     }
 
@@ -738,7 +758,7 @@ mod tests {
         }
         QuickCheck::new()
             .r#gen(Gen::new(1024))
-            .tests(10_000)
+            .tests(QC_TESTS)
             .quickcheck(prop as fn(Vec<u8>) -> bool);
     }
 
@@ -778,6 +798,120 @@ mod tests {
                 ),
                 "pos={pos}: got {err:?}"
             );
+        }
+    }
+
+    /// `decode` sizes `out` exactly from `input`, so the input and output
+    /// halves of each decode loop guard are redundant there: break one and
+    /// the other still stops the loop. Those guards are what keep the SIMD
+    /// kernel's loads and stores in bounds, so check each half on its own by
+    /// calling `decode_into` with mismatched buffers. A broken guard hands
+    /// the kernel a short slice and trips its `debug_assert!`s.
+    #[test]
+    fn decode_into_stays_in_bounds_with_mismatched_buffers() {
+        let input: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37)).collect();
+        let encoded = encode(&input); // 80 chars, 16 whole blocks
+        let encoded = encoded.as_bytes();
+
+        // Input shorter than `out`: decodes all of the input and leaves the
+        // rest of `out` untouched.
+        for blocks in 0..=16usize {
+            let mut out = vec![0xAAu8; 64];
+            decode_into(&encoded[..blocks * 5], &mut out).unwrap();
+            assert_eq!(out[..blocks * 4], input[..blocks * 4], "blocks={blocks}");
+            assert!(
+                out[blocks * 4..].iter().all(|&b| b == 0xAA),
+                "wrote past the input's blocks={blocks}"
+            );
+        }
+
+        // `out` shorter than the input: fills `out` and stops.
+        for blocks in 0..=16usize {
+            let mut out = vec![0u8; blocks * 4];
+            decode_into(encoded, &mut out).unwrap();
+            assert_eq!(out, input[..blocks * 4], "blocks={blocks}");
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Section I — Scalar fallback
+    // ──────────────────────────────────────────────────────────────────
+
+    // On x86_64 the scalar path runs only when the CPU lacks AVX2, so on an
+    // AVX2 host (every CI runner) the dispatching tests above never reach
+    // it. These call it directly and pin it to the dispatched path.
+
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    fn scalar_fallback_matches_dispatched_path() {
+        for n in 0..=64usize {
+            let input: Vec<u8> = (0..n)
+                .map(|i| (i as u8).wrapping_mul(29).wrapping_add(3))
+                .collect();
+            let encoded = encode(&input);
+
+            let mut scalar_encoded = vec![0u8; encoded.len()];
+            encode_scalar(&input, &mut scalar_encoded);
+            assert_eq!(scalar_encoded, encoded.as_bytes(), "encode len={n}");
+
+            let mut scalar_decoded = vec![0u8; n];
+            decode_scalar(encoded.as_bytes(), &mut scalar_decoded).unwrap();
+            assert_eq!(scalar_decoded, input, "decode len={n}");
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    fn scalar_fallback_reports_errors() {
+        let mut out = [0u8; 8];
+        assert_eq!(
+            decode_scalar(b"0000000 00", &mut out),
+            Err(DecodeError::InvalidChar {
+                byte: b' ',
+                position: 7
+            })
+        );
+        assert_eq!(
+            decode_scalar(b"00000|NsC1", &mut out),
+            Err(DecodeError::Overflow { position: 5 })
+        );
+
+        // An invalid char in the partial trailing block.
+        let mut out = [0u8; 5];
+        assert_eq!(
+            decode_scalar(b"000000 ", &mut out),
+            Err(DecodeError::InvalidChar {
+                byte: b' ',
+                position: 6
+            })
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Section J — Error messages
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_error_display() {
+        let cases = [
+            (
+                DecodeError::InvalidChar {
+                    byte: b' ',
+                    position: 7,
+                },
+                "invalid base85 character 0x20 at position 7",
+            ),
+            (
+                DecodeError::InvalidLength { len: 6 },
+                "invalid base85 input length: 6",
+            ),
+            (
+                DecodeError::Overflow { position: 5 },
+                "base85 block at position 5 overflows u32",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
         }
     }
 }

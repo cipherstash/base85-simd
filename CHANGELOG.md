@@ -7,6 +7,11 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+- CI: Miri runs the test suite on the x86_64 AVX2 and scalar paths, and a
+  cargo-mutants gate on aarch64 and x86_64 fails PRs that leave mutants alive.
+- Tests: the x86_64 scalar fallback, `DecodeError`'s `Display` output, and
+  `decode`'s loop bounds with mismatched buffers are now tested directly.
+
 ## [0.1.0] - 2026-05-02
 
 Initial release.

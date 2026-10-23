@@ -1,0 +1,36 @@
+# Configuration for cargo-mutants — mutation testing for base85-simd.
+#
+# Mutation testing rewrites small pieces of logic (flip a `<` to `<=`, replace a
+# body with `()`, etc.) and reruns the tests: a mutant that survives is a line
+# the suite does not actually pin down. For an encoder that is the offset
+# arithmetic, chunk-loop guards and tail handling.
+#
+# CI runs this `--in-diff` as a per-PR gate (.github/workflows/mutants.yml) on
+# both aarch64 and x86_64; `mise run mutants` runs the whole crate locally. Both
+# read the settings below, so they stay in sync.
+#
+# cargo-mutants doesn't evaluate `#[cfg]`, so it also mutates code the host
+# doesn't compile, and every such mutant "survives". Those are excluded per
+# host, not here: mutants.yml and the mise task pass `--exclude-re` for the
+# other arch's dispatch (`*_neon` / `*_avx2`, `neon::`, `ops/aarch64.rs`, and
+# the scalar fallback, which aarch64 never compiles). `unsafe fn`s, which
+# hold the SIMD intrinsics, aren't mutated at all; Miri (miri.yml) covers them.
+
+exclude_re = [
+    # Not compiled on any host we test: `encode_into_portable` /
+    # `decode_into_portable` are the one-line scalar dispatch for targets
+    # that are neither aarch64 nor x86_64.
+    "_portable",
+    # Equivalent mutant: the tail check in each encode loop. With no tail,
+    # `out_off == out.len()`, so `out.get_mut(out_off..out_off + 1)` is `None`
+    # and `encode_tail` is skipped whether the guard is `> 0` or `>= 0`. No
+    # input can tell them apart. The guard's other mutants stay gated.
+    "replace > with >= in encode_(into_neon|into_avx2|scalar)$",
+]
+
+# Property tests (quickcheck, 10k cases) run slower under mutation than a clean
+# build, so give each mutant generous headroom over the measured baseline
+# before declaring a timeout — a slow-but-correct mutant must not be
+# misreported as surviving (which would fail the gate spuriously).
+timeout_multiplier = 5.0
+minimum_test_timeout = 90

@@ -141,41 +141,16 @@ fn encode_into_neon(input: &[u8], out: &mut [u8]) {
 
     // Process 16-byte chunks with NEON. The fixed-size array references
     // make the SIMD load/store bounds type-enforced.
-    while in_off.saturating_add(16) <= input.len() {
-        let Some(in_chunk) = chunk_at::<16>(input, in_off) else {
-            return;
-        };
-        let Some(out_chunk) = chunk_at_mut::<20>(out, out_off) else {
-            return;
-        };
+    while let (Some(in_chunk), Some(out_chunk)) = (
+        chunk_at::<16>(input, in_off),
+        chunk_at_mut::<20>(out, out_off),
+    ) {
         encoder.encode_block_x4(in_chunk, out_chunk);
         in_off = in_off.saturating_add(16);
         out_off = out_off.saturating_add(20);
     }
 
-    // Mop up any remaining whole 4-byte blocks with scalar.
-    while in_off.saturating_add(4) <= input.len() {
-        let Some(block) = chunk_at::<4>(input, in_off) else {
-            return;
-        };
-        let Some(chunk) = chunk_at_mut::<5>(out, out_off) else {
-            return;
-        };
-        encode_block(block, chunk);
-        in_off = in_off.saturating_add(4);
-        out_off = out_off.saturating_add(5);
-    }
-
-    let tail_in_len = input.len().saturating_sub(in_off);
-    if tail_in_len > 0 {
-        let tail_out_len = tail_in_len.saturating_add(1);
-        if let (Some(tail_in), Some(tail_out)) = (
-            input.get(in_off..in_off.saturating_add(tail_in_len)),
-            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
-        ) {
-            encode_tail(tail_in, tail_out);
-        }
-    }
+    encode_blocks_from(input, out, in_off, out_off);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -197,41 +172,17 @@ fn encode_into_avx2(input: &[u8], out: &mut [u8]) {
     let mut out_off = 0usize;
 
     // 32 → 40 byte AVX2 chunks (8 blocks per iteration).
-    while in_off.saturating_add(32) <= input.len() {
-        let Some(in_chunk) = chunk_at::<32>(input, in_off) else {
-            return;
-        };
-        let Some(out_chunk) = chunk_at_mut::<40>(out, out_off) else {
-            return;
-        };
+    while let (Some(in_chunk), Some(out_chunk)) = (
+        chunk_at::<32>(input, in_off),
+        chunk_at_mut::<40>(out, out_off),
+    ) {
         // SAFETY: AVX2 verified above.
         unsafe { encoder.encode_block_x8(in_chunk, out_chunk) };
         in_off = in_off.saturating_add(32);
         out_off = out_off.saturating_add(40);
     }
 
-    while in_off.saturating_add(4) <= input.len() {
-        let Some(block) = chunk_at::<4>(input, in_off) else {
-            return;
-        };
-        let Some(chunk) = chunk_at_mut::<5>(out, out_off) else {
-            return;
-        };
-        encode_block(block, chunk);
-        in_off = in_off.saturating_add(4);
-        out_off = out_off.saturating_add(5);
-    }
-
-    let tail_in_len = input.len().saturating_sub(in_off);
-    if tail_in_len > 0 {
-        let tail_out_len = tail_in_len.saturating_add(1);
-        if let (Some(tail_in), Some(tail_out)) = (
-            input.get(in_off..in_off.saturating_add(tail_in_len)),
-            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
-        ) {
-            encode_tail(tail_in, tail_out);
-        }
-    }
+    encode_blocks_from(input, out, in_off, out_off);
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -241,16 +192,18 @@ fn encode_into_portable(input: &[u8], out: &mut [u8]) {
 
 #[cfg(not(target_arch = "aarch64"))]
 fn encode_scalar(input: &[u8], out: &mut [u8]) {
-    let mut in_off = 0usize;
-    let mut out_off = 0usize;
+    encode_blocks_from(input, out, 0, 0);
+}
 
-    while in_off.saturating_add(4) <= input.len() {
-        let Some(block) = chunk_at::<4>(input, in_off) else {
-            return;
-        };
-        let Some(chunk) = chunk_at_mut::<5>(out, out_off) else {
-            return;
-        };
+/// Scalar-encode `input[in_off..]` into `out[out_off..]`: whole 4-byte
+/// blocks while both buffers have room, then the partial tail block. Every
+/// encode path ends here, after its SIMD chunks (if any).
+#[inline]
+fn encode_blocks_from(input: &[u8], out: &mut [u8], mut in_off: usize, mut out_off: usize) {
+    while let (Some(block), Some(chunk)) = (
+        chunk_at::<4>(input, in_off),
+        chunk_at_mut::<5>(out, out_off),
+    ) {
         encode_block(block, chunk);
         in_off = in_off.saturating_add(4);
         out_off = out_off.saturating_add(5);
@@ -285,55 +238,16 @@ fn decode_into_neon(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
         chunk_at_mut::<16>(out, out_off),
     ) {
         if try_decode_block_x4(in_chunk, out_chunk).is_err() {
-            for _ in 0..4 {
-                let Some(block) = chunk_at::<5>(input, in_off) else {
-                    return Ok(());
-                };
-                let Some(chunk) = chunk_at_mut::<4>(out, out_off) else {
-                    return Ok(());
-                };
-                decode_block(block, chunk, in_off)?;
-                in_off = in_off.saturating_add(5);
-                out_off = out_off.saturating_add(4);
-            }
-        } else {
-            in_off = in_off.saturating_add(20);
-            out_off = out_off.saturating_add(16);
+            decode_chunk_by_block::<4>(input, out, in_off, out_off)?;
         }
+        in_off = in_off.saturating_add(20);
+        out_off = out_off.saturating_add(16);
     }
 
-    while in_off.saturating_add(5) <= input.len() {
-        let Some(block) = chunk_at::<5>(input, in_off) else {
-            return Ok(());
-        };
-        let Some(chunk) = chunk_at_mut::<4>(out, out_off) else {
-            return Ok(());
-        };
-        decode_block(block, chunk, in_off)?;
-        in_off = in_off.saturating_add(5);
-        out_off = out_off.saturating_add(4);
-    }
-
-    let tail_in_len = input.len().saturating_sub(in_off);
-    if tail_in_len > 0 {
-        let tail_out_len = tail_in_len.saturating_sub(1);
-        if let (Some(tail_in), Some(tail_out)) = (
-            input.get(in_off..in_off.saturating_add(tail_in_len)),
-            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
-        ) {
-            decode_tail(tail_in, tail_out, in_off)?;
-        }
-    }
-
-    Ok(())
+    decode_blocks_from(input, out, in_off, out_off)
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(
-    clippy::unwrap_used,
-    clippy::indexing_slicing,
-    reason = "infallible / in-bounds by loop-condition invariant; see SAFETY comment"
-)]
 fn decode_into_avx2(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     use block::try_decode_block_x8;
 
@@ -349,50 +263,19 @@ fn decode_into_avx2(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
     // 40-char (8-block) AVX2 chunks. On per-chunk failure (invalid
     // char or u32 overflow), replay the same chunk scalar so the
     // resulting DecodeError carries the precise failing byte position.
-    while in_off + 40 <= input.len() && out_off + 32 <= out.len() {
-        let Some(in_chunk) = chunk_at::<40>(input, in_off) else {
-            return Ok(());
-        };
-        let Some(out_chunk) = chunk_at_mut::<32>(out, out_off) else {
-            return Ok(());
-        };
-
+    while let (Some(in_chunk), Some(out_chunk)) = (
+        chunk_at::<40>(input, in_off),
+        chunk_at_mut::<32>(out, out_off),
+    ) {
         // SAFETY: AVX2 verified above.
-        let avx_ok = unsafe { try_decode_block_x8(in_chunk, out_chunk) }.is_ok();
-        if avx_ok {
-            in_off += 40;
-            out_off += 32;
-        } else {
-            for _ in 0..8 {
-                let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
-                let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
-                decode_block(block, chunk, in_off)?;
-                in_off += 5;
-                out_off += 4;
-            }
+        if unsafe { try_decode_block_x8(in_chunk, out_chunk) }.is_err() {
+            decode_chunk_by_block::<8>(input, out, in_off, out_off)?;
         }
+        in_off = in_off.saturating_add(40);
+        out_off = out_off.saturating_add(32);
     }
 
-    while in_off + 5 <= input.len() && out_off + 4 <= out.len() {
-        let block: &[u8; 5] = (&input[in_off..in_off + 5]).try_into().unwrap();
-        let chunk: &mut [u8; 4] = (&mut out[out_off..out_off + 4]).try_into().unwrap();
-        decode_block(block, chunk, in_off)?;
-        in_off += 5;
-        out_off += 4;
-    }
-
-    let tail_in_len = input.len().saturating_sub(in_off);
-    if tail_in_len > 0 {
-        let tail_out_len = tail_in_len.saturating_sub(1);
-        if let (Some(tail_in), Some(tail_out)) = (
-            input.get(in_off..in_off.saturating_add(tail_in_len)),
-            out.get_mut(out_off..out_off.saturating_add(tail_out_len)),
-        ) {
-            decode_tail(tail_in, tail_out, in_off)?;
-        }
-    }
-
-    Ok(())
+    decode_blocks_from(input, out, in_off, out_off)
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -402,16 +285,48 @@ fn decode_into_portable(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError>
 
 #[cfg(not(target_arch = "aarch64"))]
 fn decode_scalar(input: &[u8], out: &mut [u8]) -> Result<(), DecodeError> {
-    let mut in_off = 0usize;
-    let mut out_off = 0usize;
+    decode_blocks_from(input, out, 0, 0)
+}
 
-    while in_off.saturating_add(5) <= input.len() {
-        let Some(block) = chunk_at::<5>(input, in_off) else {
-            return Ok(());
-        };
-        let Some(chunk) = chunk_at_mut::<4>(out, out_off) else {
-            return Ok(());
-        };
+/// Scalar-decode the `BLOCKS` 5-char blocks at `input[in_off..]` into
+/// `out[out_off..]`. A SIMD decode path calls this when its kernel rejects a
+/// chunk, to find the failing block and report its exact byte position. The
+/// caller has already checked that the whole chunk fits in both buffers.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline]
+fn decode_chunk_by_block<const BLOCKS: usize>(
+    input: &[u8],
+    out: &mut [u8],
+    mut in_off: usize,
+    mut out_off: usize,
+) -> Result<(), DecodeError> {
+    for _ in 0..BLOCKS {
+        if let (Some(block), Some(chunk)) = (
+            chunk_at::<5>(input, in_off),
+            chunk_at_mut::<4>(out, out_off),
+        ) {
+            decode_block(block, chunk, in_off)?;
+        }
+        in_off = in_off.saturating_add(5);
+        out_off = out_off.saturating_add(4);
+    }
+    Ok(())
+}
+
+/// Scalar-decode `input[in_off..]` into `out[out_off..]`: whole 5-char
+/// blocks while both buffers have room, then the partial tail block. Every
+/// decode path ends here, after its SIMD chunks (if any).
+#[inline]
+fn decode_blocks_from(
+    input: &[u8],
+    out: &mut [u8],
+    mut in_off: usize,
+    mut out_off: usize,
+) -> Result<(), DecodeError> {
+    while let (Some(block), Some(chunk)) = (
+        chunk_at::<5>(input, in_off),
+        chunk_at_mut::<4>(out, out_off),
+    ) {
         decode_block(block, chunk, in_off)?;
         in_off = in_off.saturating_add(5);
         out_off = out_off.saturating_add(4);
@@ -796,6 +711,10 @@ mod tests {
         }
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // Section I — Loop bounds, on every arch
+    // ──────────────────────────────────────────────────────────────────
+
     /// `decode` sizes `out` exactly from `input`, so through it the input
     /// and output bounds of each decode loop always run out together, and a
     /// loop that checked only one of them would pass every other test.
@@ -828,12 +747,13 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // Section I — Scalar fallback
+    // Section J — Scalar fallback
     // ──────────────────────────────────────────────────────────────────
 
-    // On x86_64 the scalar path runs only when the CPU lacks AVX2, so on an
-    // AVX2 host (every CI runner) the dispatching tests above never reach
-    // it. These call it directly and pin it to the dispatched path.
+    // Compiled wherever the scalar path is (everything but aarch64). On
+    // x86_64 it runs only when the CPU lacks AVX2, so on an AVX2 host (every
+    // CI runner) the dispatching tests above never reach it. These call it
+    // directly and pin it to the dispatched path.
 
     #[cfg(not(target_arch = "aarch64"))]
     #[test]
@@ -882,7 +802,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // Section J — Error messages
+    // Section K — Error messages
     // ──────────────────────────────────────────────────────────────────
 
     #[test]

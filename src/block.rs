@@ -205,6 +205,14 @@ mod neon {
     // (`[u8; 16]`, `[u8; 20]`) with compile-time-constant bounds, so
     // panic-on-OOB cannot occur at runtime.
     #![allow(clippy::indexing_slicing)]
+    //
+    // SAFETY (register-only intrinsics): the NEON intrinsics are `unsafe`
+    // only because they are `#[target_feature(enable = "neon")]`, and NEON
+    // is part of the aarch64 baseline that every aarch64 target enables.
+    // An `unsafe { … }` around an intrinsic that touches no memory (lane
+    // arithmetic, compares, table lookups on registers) relies on that alone
+    // and carries no comment of its own. Every load or store through a
+    // pointer has its own `// SAFETY:` comment.
 
     use crate::ops::{div_85, div_85_cube, div_85_sq};
     use std::arch::aarch64::{
@@ -271,6 +279,7 @@ mod neon {
             // Load splice indexes from .rodata. Each `vld1q_u8` is one
             // load + the indexes get held in vector regs across the
             // five-deep TBX chain.
+            // SAFETY: each `IDX_OUT_*` row is a `[u8; 16]`, one vector.
             let idx0 = unsafe { vld1q_u8(IDX_OUT_1[0].as_ptr()) };
             let idx1 = unsafe { vld1q_u8(IDX_OUT_1[1].as_ptr()) };
             let idx2 = unsafe { vld1q_u8(IDX_OUT_1[2].as_ptr()) };
@@ -284,6 +293,7 @@ mod neon {
             out_1 = unsafe { vqtbx1q_u8(out_1, d3_u8, idx3) };
             out_1 = unsafe { vqtbx1q_u8(out_1, d4_u8, idx4) };
 
+            // SAFETY: as above, `[u8; 16]` rows.
             let idx2_0 = unsafe { vld1q_u8(IDX_OUT_2[0].as_ptr()) };
             let idx2_1 = unsafe { vld1q_u8(IDX_OUT_2[1].as_ptr()) };
             let idx2_2 = unsafe { vld1q_u8(IDX_OUT_2[2].as_ptr()) };
@@ -295,12 +305,15 @@ mod neon {
             out_2 = unsafe { vqtbx1q_u8(out_2, d3_u8, idx2_2) };
             out_2 = unsafe { vqtbx1q_u8(out_2, d4_u8, idx2_3) };
 
-            out_1 = unsafe { byte_to_char85_neon(out_1) };
-            out_2 = unsafe { byte_to_char85_neon(out_2) };
+            out_1 = byte_to_char85_neon(out_1);
+            out_2 = byte_to_char85_neon(out_2);
 
             // Store: 16 bytes from `out_1` to out_bytes[0..16] (aligned-
             // friendly via vst1q_u8), then 4 bytes from `out_2` lane-0
             // copied byte-wise to avoid any *u32 alignment hazard.
+            // SAFETY: `out_bytes` is `&mut [u8; 20]`, so bytes 0..16 take the
+            // first store and bytes 16..20 the 4-byte copy; `tail_buf` is a
+            // local `[u8; 16]`, one vector, and doesn't overlap `out_bytes`.
             unsafe {
                 vst1q_u8(out_bytes.as_mut_ptr(), out_1);
                 let mut tail_buf = [0u8; 16];
@@ -326,8 +339,10 @@ mod neon {
         let chars_main = unsafe { vld1q_u8(input.as_ptr()) };
         let mut tail_buf = [0u8; 16];
         tail_buf[..4].copy_from_slice(&input[16..20]);
+        // SAFETY: `tail_buf` is a local `[u8; 16]`, one vector.
         let chars_tail = unsafe { vld1q_u8(tail_buf.as_ptr()) };
 
+        // SAFETY: `TAIL_VALID_MASK` is a `[u8; 16]`, one vector.
         let tail_valid_mask = unsafe { vld1q_u8(TAIL_VALID_MASK.as_ptr()) };
 
         // Char range validation: any byte not in [33, 126] is invalid.
@@ -344,8 +359,8 @@ mod neon {
         // as 0xFF; we OR those into the invalid-mask. Out-of-range chars
         // index past the table and yield 0 (which we'd otherwise mistake
         // for digit '0'), hence the explicit range check above.
-        let digits_main = unsafe { char85_to_byte_neon(chars_main) };
-        let digits_tail = unsafe { char85_to_byte_neon(chars_tail) };
+        let digits_main = char85_to_byte_neon(chars_main);
+        let digits_tail = char85_to_byte_neon(chars_tail);
 
         let invalid_dig_main = unsafe { vceqq_u8(digits_main, vdupq_n_u8(0xFF)) };
         let invalid_dig_tail =
@@ -398,6 +413,7 @@ mod neon {
         static IDX_D3: [u8; 16] = idx(3);
         static IDX_D4: [u8; 16] = idx(4);
 
+        // SAFETY: each `IDX_D*` is a `[u8; 16]`, one vector.
         let v_d0 = unsafe { vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D0.as_ptr()))) };
         let v_d1 = unsafe { vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D1.as_ptr()))) };
         let v_d2 = unsafe { vreinterpretq_u32_u8(vqtbl2q_u8(combined, vld1q_u8(IDX_D2.as_ptr()))) };
@@ -442,7 +458,7 @@ mod neon {
     /// 0xFF; out-of-range chars (< 33 or > 126) yield unspecified output
     /// and must be filtered separately by the caller.
     #[inline]
-    unsafe fn char85_to_byte_neon(encoded: uint8x16_t) -> uint8x16_t {
+    fn char85_to_byte_neon(encoded: uint8x16_t) -> uint8x16_t {
         // Two tables covering ASCII [33, 96] and [97, 128]. Gaps in the
         // alphabet are filled with 0xFF.
         static CHAR_TO_85: [u8; 64] = [
@@ -456,6 +472,8 @@ mod neon {
             58, 59, 60, 61, 81, 82, 83, 84, 0xFF, 0xFF,
         ];
 
+        // SAFETY: the tables are `[u8; 64]` and `[u8; 32]`, exactly the four
+        // and two vectors each load reads.
         let t1 = unsafe { vld1q_u8_x4(CHAR_TO_85.as_ptr()) };
         let t2 = unsafe { vld1q_u8_x2(CHAR_TO_85_X2.as_ptr()) };
 
@@ -469,13 +487,15 @@ mod neon {
 
     /// Maps 16 lane-wise digit values (0..85) to ASCII characters.
     #[inline]
-    unsafe fn byte_to_char85_neon(x85: uint8x16_t) -> uint8x16_t {
+    fn byte_to_char85_neon(x85: uint8x16_t) -> uint8x16_t {
         // 64 chars (fits in vqtbl4) + 21 chars (padded to 32, fits in vqtbl2).
         // The padding bytes ('#') in B85_X2 are unreachable when x85 < 85.
         static B85_X4: [u8; 64] =
             *b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#";
         static B85_X2: [u8; 32] = *b"$%&()*+-;<=>?@^_`{|}~###########";
 
+        // SAFETY: the tables are `[u8; 64]` and `[u8; 32]`, exactly the four
+        // and two vectors each load reads.
         let t1 = unsafe { vld1q_u8_x4(B85_X4.as_ptr()) };
         let t2 = unsafe { vld1q_u8_x2(B85_X2.as_ptr()) };
 
@@ -492,6 +512,7 @@ mod neon {
     /// can't guarantee). Compiles to `ldr q + rev32.16b`.
     #[inline]
     fn load_u32x4_be(bytes: &[u8; 16]) -> uint32x4_t {
+        // SAFETY: `bytes` is `&[u8; 16]`, one vector.
         unsafe {
             let raw = vld1q_u8(bytes.as_ptr());
             let swapped = vrev32q_u8(raw);

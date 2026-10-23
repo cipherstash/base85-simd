@@ -43,6 +43,12 @@ for decoding.
   `DecodeError` carries a precise byte position.
 - Tested against the `base85` reference crate via quickcheck round-trip and
   parity checks.
+- The x86_64 AVX2 and scalar paths run under [Miri](https://github.com/rust-lang/miri)
+  in CI to catch undefined behaviour in the `unsafe` SIMD code. Miri can't
+  interpret the NEON intrinsics, so the aarch64 path runs under
+  AddressSanitizer in CI instead.
+- Mutation-tested with [cargo-mutants](https://mutants.rs) on both aarch64
+  and x86_64; CI fails a PR that adds logic its tests don't pin down.
 
 ## Drop-in compatibility with the `base85` crate
 

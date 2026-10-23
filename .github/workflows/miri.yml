@@ -1,0 +1,86 @@
+name: Miri
+
+# Runs the test suite under Miri to detect undefined behaviour in the crate's
+# `unsafe` code: the AVX2 loads/stores and `#[target_feature]` calls in
+# block.rs / ops/x86_64.rs, and the `from_utf8_unchecked` in `encode`. Miri
+# interprets the tests under its aliasing and provenance models, catching
+# out-of-bounds SIMD accesses and borrow violations that a normal test run
+# (and often ASan) can miss.
+#
+# x86_64 only. Miri implements the AVX2 intrinsics this crate uses, but not
+# the NEON table lookups (`vqtbx1q_u8` is "unsupported operation"), so the
+# aarch64 path cannot run under Miri. The matrix runs the x86_64 target twice:
+#
+# - `avx2`: `-Ctarget-feature=+avx2`. Under Miri, `is_x86_feature_detected!`
+#   reports exactly the compile-time features, so this takes the SIMD path.
+# - `scalar`: no extra features, so detection fails and `encode`/`decode`
+#   take the scalar fallback. This also checks the runtime gate itself.
+#
+# The brute-force parity sweeps are `#[cfg_attr(miri, ignore)]` and the
+# property tests drop to a few cases under `cfg(miri)` (see the tests); the
+# native test job in ci.yml is the correctness sweep.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/miri.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel an in-flight run when the PR is pushed again — only the latest matters.
+concurrency:
+  group: miri-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Cases for the `quickcheck!` macro tests, which can't take a count in code.
+  QUICKCHECK_TESTS: 16
+
+jobs:
+  miri:
+    name: miri / x86_64 / ${{ matrix.path }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - path: avx2
+            rustflags: "-Ctarget-feature=+avx2"
+          - path: scalar
+            rustflags: ""
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly + miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-${{ matrix.path }}
+
+      - name: miri test
+        # Default models (Stacked Borrows). The first run builds a Miri
+        # sysroot (a few minutes); cached runs are quicker.
+        run: cargo +nightly miri test --locked
+
+      - name: miri test, strict models
+        # The same suite under Tree Borrows, with strict provenance (no
+        # integer-to-pointer casts may be dereferenced) and symbolic alignment
+        # (alignment judged from the allocation, not the address). Each model
+        # rejects code the default run accepts; the SIMD loads and stores
+        # go through raw pointers, so they must satisfy all of them.
+        env:
+          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
+        run: cargo +nightly miri test --locked --target-dir target/miri-strict

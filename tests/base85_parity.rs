@@ -30,6 +30,11 @@
 
 use std::panic::AssertUnwindSafe;
 
+/// Cases per property test. Miri interprets every instruction, so under it
+/// the property tests shrink to a handful of cases; the native run is the
+/// parity sweep.
+const QC_TESTS: u64 = if cfg!(miri) { 16 } else { 10_000 };
+
 // ─────────────────────────────────────────────────────────────────────────
 // Encode parity
 // ─────────────────────────────────────────────────────────────────────────
@@ -63,6 +68,7 @@ fn encode_parity_all_max_inputs() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "brute-force sweep; hours under Miri, no new code path")]
 fn encode_parity_one_megabyte() {
     let input: Vec<u8> = (0..(1u32 << 20))
         .map(|i| (i.wrapping_mul(2_654_435_761)) as u8)
@@ -106,7 +112,7 @@ fn encode_parity_quickcheck() {
     }
     quickcheck::QuickCheck::new()
         .r#gen(quickcheck::Gen::new(1024))
-        .tests(10_000)
+        .tests(QC_TESTS)
         .quickcheck(prop as fn(Vec<u8>) -> bool);
 }
 
@@ -144,7 +150,7 @@ fn decode_parity_quickcheck() {
     }
     quickcheck::QuickCheck::new()
         .r#gen(quickcheck::Gen::new(1024))
-        .tests(10_000)
+        .tests(QC_TESTS)
         .quickcheck(prop as fn(Vec<u8>) -> bool);
 }
 
@@ -167,6 +173,7 @@ fn cross_decode_our_encode_their_decode() {
 /// 100k samples covering low values, high values, powers-of-two,
 /// powers-of-85, and the encode-overflow boundary.
 #[test]
+#[cfg_attr(miri, ignore = "brute-force sweep; hours under Miri, no new code path")]
 fn decode_single_block_parity_sampled_u32() {
     let mut values: Vec<u32> = Vec::new();
     // Boundary values
@@ -299,6 +306,7 @@ fn single_byte_inputs_byte_identical() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "brute-force sweep; hours under Miri, no new code path")]
 fn two_byte_inputs_byte_identical() {
     // 65_536 cases — fast to enumerate.
     for v in 0u16..=u16::MAX {
@@ -313,6 +321,7 @@ fn two_byte_inputs_byte_identical() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "brute-force sweep; hours under Miri, no new code path")]
 fn three_byte_inputs_stratified_sample() {
     // 16M cases would be slow; sample a stratified 200k.
     let mut state: u64 = 0xC0FFEE_DEADBEEF;
@@ -365,6 +374,6 @@ fn fuzz_cross_compat_high_iter() {
     }
     quickcheck::QuickCheck::new()
         .r#gen(quickcheck::Gen::new(2048))
-        .tests(5_000)
+        .tests(QC_TESTS / 2)
         .quickcheck(prop as fn(Vec<u8>) -> bool);
 }

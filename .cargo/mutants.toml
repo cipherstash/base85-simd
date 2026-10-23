@@ -1,0 +1,40 @@
+# Configuration for cargo-mutants — mutation testing for base85-simd.
+#
+# Mutation testing rewrites small pieces of logic (flip a `<` to `<=`, replace a
+# body with `()`, etc.) and reruns the tests: a mutant that survives is a line
+# the suite does not actually pin down. For an encoder that is the offset
+# arithmetic, chunk-loop guards and tail handling.
+#
+# Run it through scripts/mutants.sh, which adds the per-arch excludes this
+# file can't express (cargo-mutants doesn't evaluate `#[cfg]`, so each host
+# excludes the arch it doesn't compile). CI (.github/workflows/mutants.yml)
+# runs it on aarch64 and x86_64, mutating a PR's changed lines, or the whole
+# crate when the PR changes the mutants setup or its diff yields no mutants;
+# `mise run mutants` sweeps the whole crate locally. `unsafe fn`s, which
+# hold the AVX2 intrinsics, aren't mutated at all; Miri (miri.yml) covers
+# them.
+
+exclude_re = [
+    # Not compiled on any host we test: `encode_into_portable` /
+    # `decode_into_portable` are the one-line scalar dispatch for targets
+    # that are neither aarch64 nor x86_64.
+    "_portable",
+    # Equivalent mutant: the encode tail check. With no tail,
+    # `out_off == out.len()`, so `out.get_mut(out_off..out_off + 1)` is `None`
+    # and `encode_tail` is skipped whether the guard is `> 0` or `>= 0`. No
+    # input can tell them apart. The guard's other mutants stay gated.
+    "replace > with >= in encode_blocks_from$",
+    # Checked by Miri, not by output: the `!is_x86_feature_detected!("avx2")`
+    # check in each AVX2 dispatch. Inverting it on an AVX2 host routes every
+    # call to the scalar fallback, which returns the same bytes, so no test
+    # can tell. On a host without AVX2 it would run AVX2 code, which is UB;
+    # the Miri `scalar` job (miri.yml) builds without AVX2 and fails on that.
+    "delete ! in (encode|decode)_into_avx2$",
+]
+
+# Property tests (quickcheck, 10k cases) run slower under mutation than a clean
+# build, so give each mutant generous headroom over the measured baseline
+# before declaring a timeout — a slow-but-correct mutant must not be
+# misreported as surviving (which would fail the gate spuriously).
+timeout_multiplier = 5.0
+minimum_test_timeout = 90
